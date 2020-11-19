@@ -149,6 +149,7 @@ enum flow_action_id {
 	FLOW_ACTION_POLICE,
 	FLOW_ACTION_CT,
 	FLOW_ACTION_CT_METADATA,
+	FLOW_ACTION_NAT,
 	FLOW_ACTION_MPLS_PUSH,
 	FLOW_ACTION_MPLS_POP,
 	FLOW_ACTION_MPLS_MANGLE,
@@ -256,6 +257,12 @@ struct flow_action_entry {
 			u32 labels[4];
 			bool orig_dir;
 		} ct_metadata;
+		struct {				/* FLOW_ACTION_NAT */
+			__be32		old_addr;
+			__be32		new_addr;
+			__be32		mask;
+			u32		flags;
+		} nat;
 		struct {				/* FLOW_ACTION_MPLS_PUSH */
 			u32		label;
 			__be16		proto;

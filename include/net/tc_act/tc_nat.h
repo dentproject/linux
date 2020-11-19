@@ -16,4 +16,33 @@ struct tcf_nat {
 
 #define to_tcf_nat(a) ((struct tcf_nat *)a)
 
+static inline bool is_tcf_nat(const struct tc_action *act)
+{
+#if defined(CONFIG_NET_CLS_ACT) && IS_ENABLED(CONFIG_NET_ACT_NAT)
+	if (act->ops && act->ops->id == TCA_ID_NAT)
+		return true;
+#endif
+	return false;
+}
+
+static inline __be32 tcf_nat_old_addr(const struct tc_action *a)
+{
+	return to_tcf_nat(a)->old_addr;
+}
+
+static inline __be32 tcf_nat_new_addr(const struct tc_action *a)
+{
+	return to_tcf_nat(a)->new_addr;
+}
+
+static inline __be32 tcf_nat_mask(const struct tc_action *a)
+{
+	return to_tcf_nat(a)->mask;
+}
+
+static inline u32 tcf_nat_flags(const struct tc_action *a)
+{
+	return to_tcf_nat(a)->flags;
+}
+
 #endif /* __NET_TC_NAT_H */
