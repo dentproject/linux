@@ -2234,6 +2234,8 @@ static int phylink_sfp_config(struct phylink *pl, u8 mode,
 		return ret;
 	}
 
+	pl->link_config.an_enabled = phylink_test(pl->supported, Autoneg);
+
 	phylink_dbg(pl, "requesting link mode %s/%s with support %*pb\n",
 		    phylink_an_mode_str(mode), phy_modes(config.interface),
 		    __ETHTOOL_LINK_MODE_MASK_NBITS, support);
@@ -2289,7 +2291,14 @@ static int phylink_sfp_module_insert(void *upstream,
 
 	return phylink_sfp_config(pl, MLO_AN_INBAND, support, support);
 }
+static void phylink_sfp_module_remove (void *upstream)
+{
+    struct phylink *pl = upstream;
 
+    ASSERT_RTNL();
+
+    linkmode_zero(pl->supported);
+}
 static int phylink_sfp_module_start(void *upstream)
 {
 	struct phylink *pl = upstream;
@@ -2394,6 +2403,7 @@ static const struct sfp_upstream_ops sfp_phylink_ops = {
 	.attach = phylink_sfp_attach,
 	.detach = phylink_sfp_detach,
 	.module_insert = phylink_sfp_module_insert,
+	.module_remove = phylink_sfp_module_remove,
 	.module_start = phylink_sfp_module_start,
 	.module_stop = phylink_sfp_module_stop,
 	.link_up = phylink_sfp_link_up,
