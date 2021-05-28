@@ -176,7 +176,7 @@ struct flow_offload {
 	struct rcu_head				rcu_head;
 };
 
-#define NF_FLOW_TIMEOUT (30 * HZ)
+#define NF_FLOW_TIMEOUT (60 * HZ)
 #define nf_flowtable_time_stamp	(u32)jiffies
 
 unsigned long flow_offload_get_timeout(struct flow_offload *flow);
