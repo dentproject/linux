@@ -1574,6 +1574,9 @@ int phylink_ethtool_ksettings_set(struct phylink *pl,
 	linkmode_and(config.advertising, kset->link_modes.advertising,
 		     pl->supported);
 
+	if(kset->base.speed != config.speed)
+		major_change = true;
+
 	/* FIXME: should we reject autoneg if phy/mac does not support it? */
 	switch (kset->base.autoneg) {
 	case AUTONEG_DISABLE:
@@ -1625,8 +1628,6 @@ int phylink_ethtool_ksettings_set(struct phylink *pl,
 	config.an_enabled = kset->base.autoneg == AUTONEG_ENABLE;
 	linkmode_mod_bit(ETHTOOL_LINK_MODE_Autoneg_BIT, config.advertising,
 			 config.an_enabled);
-	if(kset->base.speed != config.speed)
-		major_change = true;
 
 	/* Validate without changing the current supported mask. */
 	linkmode_copy(support, pl->supported);
