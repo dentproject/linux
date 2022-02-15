@@ -187,6 +187,7 @@ static void br_stp_stop(struct net_bridge *br)
 		if (err)
 			br_err(br, "failed to stop userspace STP (%d)\n", err);
 
+		br->stp_enabled = BR_NO_STP;
 		/* To start timers on any ports left in blocking */
 		spin_lock_bh(&br->lock);
 		br_port_state_selection(br);
