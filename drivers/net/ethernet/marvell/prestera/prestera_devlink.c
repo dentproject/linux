@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: BSD-3-Clause OR GPL-2.0
-/* Copyright (c) 2019-2020 Marvell International Ltd. All rights reserved */
+/* Copyright (c) 2019-2021 Marvell International Ltd. All rights reserved */
 
 #include <net/devlink.h>
+#include <linux/version.h>
+#include <linux/bitops.h>
+#include <linux/bitfield.h>
 
 #include "prestera_devlink.h"
 #include "prestera_hw.h"
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 /* All driver-specific traps must be documented in
  * Documentation/networking/devlink/prestera.rst
  */
@@ -42,7 +46,6 @@ enum {
 	DEVLINK_PRESTERA_TRAP_ID_ILLEGAL_IP_ADDR,
 	DEVLINK_PRESTERA_TRAP_ID_INVALID_SA,
 	DEVLINK_PRESTERA_TRAP_ID_LOCAL_PORT,
-	DEVLINK_PRESTERA_TRAP_ID_PORT_NO_VLAN,
 	DEVLINK_PRESTERA_TRAP_ID_RXDMA_DROP,
 };
 
@@ -96,8 +99,6 @@ enum {
 	"icmp"
 #define DEVLINK_PRESTERA_TRAP_NAME_RXDMA_DROP \
 	"rxdma_drop"
-#define DEVLINK_PRESTERA_TRAP_NAME_PORT_NO_VLAN \
-	"port_no_vlan"
 #define DEVLINK_PRESTERA_TRAP_NAME_LOCAL_PORT \
 	"local_port"
 #define DEVLINK_PRESTERA_TRAP_NAME_INVALID_SA \
@@ -158,6 +159,36 @@ struct prestera_trap_data {
 			    DEVLINK_PRESTERA_TRAP_NAME_##_id,		      \
 			    DEVLINK_TRAP_GROUP_GENERIC_ID_##_group_id,	      \
 			    PRESTERA_TRAP_METADATA)
+
+#define PRESTERA_DEVLINK_PORT_PARAM_NUM		(3)
+#define PRESTERA_DEVLINK_PORT_PARAM_FP_MASK	GENMASK(5, 0)
+#define PRESTERA_DEVLINK_PORT_PARAM_TYPE_MASK	GENMASK(7, 6)
+#define PRESTERA_DEVLINK_PORT_PARAM_PREP_ID(type_id, fp_id)		      \
+	((FIELD_PREP(PRESTERA_DEVLINK_PORT_PARAM_TYPE_MASK, type_id) |	      \
+	 FIELD_PREP(PRESTERA_DEVLINK_PORT_PARAM_FP_MASK, fp_id)) +	      \
+	 PRESTERA_DEVLINK_PORT_PARAM_ID_BASE)
+
+enum {
+	PORT_PARAM_ID_BC_RATE = 0,
+	PORT_PARAM_ID_UC_UNK_RATE = 1,
+	PORT_PARAM_ID_MC_RATE = 2
+};
+
+struct prestera_strom_control_cfg {
+	u32 bc_kbyte_per_sec_rate;
+	u32 unk_uc_kbyte_per_sec_rate;
+	u32 unreg_mc_kbyte_per_sec_rate;
+};
+
+struct prestera_storm_control {
+	struct prestera_switch *sw;
+	struct prestera_strom_control_cfg *cfg;
+	struct devlink_param *port_params[PRESTERA_DEVLINK_PORT_PARAM_NUM];
+};
+
+enum prestera_devlink_port_param_id {
+	PRESTERA_DEVLINK_PORT_PARAM_ID_BASE = DEVLINK_PARAM_GENERIC_ID_MAX + 1,
+};
 
 static const struct devlink_trap_group prestera_trap_groups_arr[] = {
 	/* No policer is associated with following groups (policerid == 0)*/
@@ -311,10 +342,6 @@ static struct prestera_trap prestera_trap_items_arr[] = {
 		.cpu_code = 37,
 	},
 	{
-		.trap = PRESTERA_TRAP_DRIVER_DROP(PORT_NO_VLAN, L2_DROPS),
-		.cpu_code = 39,
-	},
-	{
 		.trap = PRESTERA_TRAP_DRIVER_DROP(LOCAL_PORT, L2_DROPS),
 		.cpu_code = 56,
 	},
@@ -341,15 +368,120 @@ static struct prestera_trap prestera_trap_items_arr[] = {
 	},
 	{
 		.trap = PRESTERA_TRAP_DRIVER_DROP(MET_RED, BUFFER_DROPS),
-		.cpu_code = 185,
+		.cpu_code = 186,
 	},
 };
+#endif
+
+static int prestera_storm_control_rate_set(struct devlink *dl, u32 id,
+					   struct devlink_param_gset_ctx *ctx);
+
+static int prestera_storm_control_rate_get(struct devlink *dl, u32 id,
+					   struct devlink_param_gset_ctx *ct);
 
 static void prestera_devlink_traps_fini(struct prestera_switch *sw);
+
+static int prestera_trap_init(struct devlink *devlink,
+			      const struct devlink_trap *trap, void *trap_ctx);
+
+static int prestera_trap_action_set(struct devlink *devlink,
+				    const struct devlink_trap *trap,
+				    enum devlink_trap_action action,
+				    struct netlink_ext_ack *extack);
+
+static int prestera_devlink_traps_register(struct prestera_switch *sw);
 
 static int prestera_drop_counter_get(struct devlink *devlink,
 				     const struct devlink_trap *trap,
 				     u64 *p_drops);
+
+static int prestera_storm_control_init(struct prestera_switch *sw);
+static void prestera_storm_control_fini(struct prestera_switch *sw);
+
+static int prestera_storm_control_rate_set(struct devlink *dl, u32 id,
+					   struct devlink_param_gset_ctx *ctx)
+{
+	struct prestera_switch *sw = devlink_priv(dl);
+	struct prestera_strom_control_cfg *cfg;
+	u32 kbyte_per_sec_rate = ctx->val.vu32;
+	struct prestera_port *port = NULL;
+	struct prestera_storm_control *sc;
+	u32 *param_to_set = NULL;
+	u32 storm_type;
+	int type_id;
+	int fp_id;
+	int ret;
+
+	id -= PRESTERA_DEVLINK_PORT_PARAM_ID_BASE;
+	fp_id = FIELD_GET(PRESTERA_DEVLINK_PORT_PARAM_FP_MASK, id);
+	type_id = FIELD_GET(PRESTERA_DEVLINK_PORT_PARAM_TYPE_MASK, id);
+
+	port = prestera_port_find_by_fp_id(fp_id);
+	if (!port)
+		return -EINVAL;
+
+	sc = sw->storm_control;
+	cfg = &sc->cfg[fp_id - 1];
+
+	switch (type_id) {
+	case PORT_PARAM_ID_BC_RATE:
+		param_to_set = &cfg->bc_kbyte_per_sec_rate;
+		storm_type = PRESTERA_PORT_STORM_CTL_TYPE_BC;
+		break;
+	case PORT_PARAM_ID_UC_UNK_RATE:
+		param_to_set = &cfg->unk_uc_kbyte_per_sec_rate;
+		storm_type = PRESTERA_PORT_STORM_CTL_TYPE_UC_UNK;
+		break;
+	case PORT_PARAM_ID_MC_RATE:
+		param_to_set = &cfg->unreg_mc_kbyte_per_sec_rate;
+		storm_type = PRESTERA_PORT_STORM_CTL_TYPE_MC;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (kbyte_per_sec_rate != *param_to_set) {
+		ret = prestera_hw_port_storm_control_cfg_set(port, storm_type,
+							     kbyte_per_sec_rate);
+		if (ret)
+			return ret;
+
+		*param_to_set = kbyte_per_sec_rate;
+	}
+
+	return 0;
+}
+
+static int prestera_storm_control_rate_get(struct devlink *dl, u32 id,
+					   struct devlink_param_gset_ctx *ctx)
+{
+	struct prestera_switch *sw = devlink_priv(dl);
+	struct prestera_strom_control_cfg *cfg;
+	struct prestera_storm_control *sc;
+	int type_id;
+	int fp_id;
+
+	id -= PRESTERA_DEVLINK_PORT_PARAM_ID_BASE;
+	fp_id = FIELD_GET(PRESTERA_DEVLINK_PORT_PARAM_FP_MASK, id);
+	type_id = FIELD_GET(PRESTERA_DEVLINK_PORT_PARAM_TYPE_MASK, id);
+
+	sc = sw->storm_control;
+	cfg = &sc->cfg[fp_id - 1];
+
+	switch (type_id) {
+	case PORT_PARAM_ID_BC_RATE:
+		ctx->val.vu32 = cfg->bc_kbyte_per_sec_rate;
+		return 0;
+	case PORT_PARAM_ID_UC_UNK_RATE:
+		ctx->val.vu32 = cfg->unk_uc_kbyte_per_sec_rate;
+		return 0;
+	case PORT_PARAM_ID_MC_RATE:
+		ctx->val.vu32 = cfg->unreg_mc_kbyte_per_sec_rate;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
 
 static int prestera_dl_info_get(struct devlink *dl,
 				struct devlink_info_req *req,
@@ -372,16 +504,6 @@ static int prestera_dl_info_get(struct devlink *dl,
 					       DEVLINK_INFO_VERSION_GENERIC_FW,
 					       buf);
 }
-
-static int prestera_trap_init(struct devlink *devlink,
-			      const struct devlink_trap *trap, void *trap_ctx);
-
-static int prestera_trap_action_set(struct devlink *devlink,
-				    const struct devlink_trap *trap,
-				    enum devlink_trap_action action,
-				    struct netlink_ext_ack *extack);
-
-static int prestera_devlink_traps_register(struct prestera_switch *sw);
 
 static const struct devlink_ops prestera_dl_ops = {
 	.info_get = prestera_dl_info_get,
@@ -414,7 +536,7 @@ int prestera_devlink_register(struct prestera_switch *sw)
 
 	err = devlink_register(dl);
 	if (err) {
-		dev_err(prestera_dev(sw), "devlink_register failed: %d\n", err);
+		dev_err(sw->dev->dev, "devlink_register failed: %d\n", err);
 		return err;
 	}
 
@@ -426,27 +548,40 @@ int prestera_devlink_register(struct prestera_switch *sw)
 		return err;
 	}
 
+	err = prestera_storm_control_init(sw);
+	if (err) {
+		prestera_devlink_traps_fini(sw);
+		devlink_unregister(dl);
+		dev_err(sw->dev->dev,
+			"prestera_storm_control_init failed: %d\n",
+			err);
+		return err;
+	}
+
 	return 0;
 }
 
 void prestera_devlink_unregister(struct prestera_switch *sw)
 {
-	struct prestera_trap_data *trap_data = sw->trap_data;
 	struct devlink *dl = priv_to_devlink(sw);
 
 	prestera_devlink_traps_fini(sw);
+	prestera_storm_control_fini(sw);
 	devlink_unregister(dl);
-
-	kfree(trap_data->trap_items_arr);
-	kfree(trap_data);
 }
 
 int prestera_devlink_port_register(struct prestera_port *port)
 {
 	struct prestera_switch *sw = port->sw;
-	struct devlink *dl = priv_to_devlink(sw);
 	struct devlink_port_attrs attrs = {};
+	struct prestera_storm_control *sc;
+	struct devlink *dl;
 	int err;
+	int i;
+
+	sc = sw->storm_control;
+
+	dl = priv_to_devlink(sw);
 
 	attrs.flavour = DEVLINK_PORT_FLAVOUR_PHYSICAL;
 	attrs.phys.port_number = port->fp_id;
@@ -457,21 +592,54 @@ int prestera_devlink_port_register(struct prestera_port *port)
 
 	err = devlink_port_register(dl, &port->dl_port, port->fp_id);
 	if (err) {
-		dev_err(prestera_dev(sw), "devlink_port_register failed: %d\n", err);
+		dev_err(sw->dev->dev, "devlink_port_register failed\n");
 		return err;
 	}
+
+	for (i = 0; i < PRESTERA_DEVLINK_PORT_PARAM_NUM; ++i) {
+		struct devlink_param *port_params =
+			&sc->port_params[i][port->fp_id - 1];
+
+		err = devlink_port_params_register(&port->dl_port,
+						   port_params,
+						   1);
+		if (err) {
+			devlink_port_unregister(&port->dl_port);
+			dev_err(sw->dev->dev,
+				"devlink_port_params_register failed\n");
+			return err;
+		}
+	}
+
+	devlink_port_params_publish(&port->dl_port);
 
 	return 0;
 }
 
 void prestera_devlink_port_unregister(struct prestera_port *port)
 {
+	struct prestera_switch *sw = port->sw;
+	struct prestera_storm_control *sc;
+	int i;
+
+	sc = sw->storm_control;
+
+	devlink_port_params_unpublish(&port->dl_port);
+
+	for (i = 0; i < PRESTERA_DEVLINK_PORT_PARAM_NUM; ++i) {
+		struct devlink_param *port_params = sc->port_params[i];
+
+		devlink_port_params_unregister(&port->dl_port,
+					       &port_params[port->fp_id - 1],
+					       1);
+	}
+
 	devlink_port_unregister(&port->dl_port);
 }
 
 void prestera_devlink_port_set(struct prestera_port *port)
 {
-	devlink_port_type_eth_set(&port->dl_port, port->dev);
+	devlink_port_type_eth_set(&port->dl_port, port->net_dev);
 }
 
 void prestera_devlink_port_clear(struct prestera_port *port)
@@ -486,20 +654,98 @@ struct devlink_port *prestera_devlink_get_port(struct net_device *dev)
 	return &port->dl_port;
 }
 
+static int prestera_storm_control_init(struct prestera_switch *sw)
+{
+	struct prestera_storm_control *sc;
+	int i, j;
+	int err;
+
+	sc = kzalloc(sizeof(*sc), GFP_KERNEL);
+	if (!sc)
+		return -ENOMEM;
+
+	sc->cfg = kcalloc(sw->port_count,
+			  sizeof(*sc->cfg),
+			  GFP_KERNEL);
+	if (!sc->cfg) {
+		err = -ENOMEM;
+		goto err_values_alloca;
+	}
+
+	for (i = 0; i < PRESTERA_DEVLINK_PORT_PARAM_NUM; ++i) {
+		sc->port_params[i] =
+			kcalloc(sw->port_count, sizeof(struct devlink_param),
+				GFP_KERNEL);
+		if (!sc->port_params[i]) {
+			err = -ENOMEM;
+			goto err_params_alloca;
+		}
+	}
+
+	for (i = 0; i < PRESTERA_DEVLINK_PORT_PARAM_NUM; ++i) {
+		const char *param_names[PRESTERA_DEVLINK_PORT_PARAM_NUM] = {
+			[PORT_PARAM_ID_BC_RATE] =
+				"bc_kbyte_per_sec_rate",
+			[PORT_PARAM_ID_UC_UNK_RATE] =
+				"unk_uc_kbyte_per_sec_rate",
+			[PORT_PARAM_ID_MC_RATE] =
+				"unreg_mc_kbyte_per_sec_rate",
+		};
+		struct devlink_param *port_params = sc->port_params[i];
+
+		for (j = 0; j < sw->port_count; ++j) {
+			port_params[j].id =
+				PRESTERA_DEVLINK_PORT_PARAM_PREP_ID(i, j + 1);
+			port_params[j].name = param_names[i];
+			port_params[j].type = DEVLINK_PARAM_TYPE_U32;
+			port_params[j].supported_cmodes =
+				BIT(DEVLINK_PARAM_CMODE_RUNTIME);
+			port_params[j].get = prestera_storm_control_rate_get;
+			port_params[j].set = prestera_storm_control_rate_set;
+		}
+	}
+
+	sc->sw = sw;
+	sw->storm_control = sc;
+
+	return 0;
+
+err_params_alloca:
+	for (i = 0; i < PRESTERA_DEVLINK_PORT_PARAM_NUM; ++i)
+		kfree(sc->port_params[i]);
+	kfree(sc->cfg);
+err_values_alloca:
+	kfree(sc);
+	return err;
+}
+
+static void prestera_storm_control_fini(struct prestera_switch *sw)
+{
+	struct prestera_storm_control *sc = sw->storm_control;
+	int i;
+
+	for (i = 0; i < PRESTERA_DEVLINK_PORT_PARAM_NUM; ++i)
+		kfree(sc->port_params[i]);
+
+	kfree(sc->cfg);
+	kfree(sc);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 static int prestera_devlink_traps_register(struct prestera_switch *sw)
 {
 	const u32 groups_count = ARRAY_SIZE(prestera_trap_groups_arr);
 	const u32 traps_count = ARRAY_SIZE(prestera_trap_items_arr);
 	struct devlink *devlink = priv_to_devlink(sw);
-	struct prestera_trap_data *trap_data;
 	struct prestera_trap *prestera_trap;
+	struct prestera_trap_data *trap_data;
 	int err, i;
 
 	trap_data = kzalloc(sizeof(*trap_data), GFP_KERNEL);
 	if (!trap_data)
 		return -ENOMEM;
 
-	trap_data->trap_items_arr = kcalloc(traps_count,
+	trap_data->trap_items_arr = kcalloc(ARRAY_SIZE(prestera_trap_items_arr),
 					    sizeof(struct prestera_trap_item),
 					    GFP_KERNEL);
 	if (!trap_data->trap_items_arr) {
@@ -508,7 +754,7 @@ static int prestera_devlink_traps_register(struct prestera_switch *sw)
 	}
 
 	trap_data->sw = sw;
-	trap_data->traps_count = traps_count;
+	trap_data->traps_count = ARRAY_SIZE(prestera_trap_items_arr);
 	sw->trap_data = trap_data;
 
 	err = devlink_trap_groups_register(devlink, prestera_trap_groups_arr,
@@ -531,8 +777,6 @@ err_trap_register:
 		prestera_trap = &prestera_trap_items_arr[i];
 		devlink_traps_unregister(devlink, &prestera_trap->trap, 1);
 	}
-	devlink_trap_groups_unregister(devlink, prestera_trap_groups_arr,
-				       groups_count);
 err_groups_register:
 	kfree(trap_data->trap_items_arr);
 err_trap_items_alloc:
@@ -608,7 +852,7 @@ static int prestera_trap_action_set(struct devlink *devlink,
 				    struct netlink_ext_ack *extack)
 {
 	/* Currently, driver does not support trap action altering */
-	return -EOPNOTSUPP;
+	return -ENOTSUPP;
 }
 
 static int prestera_drop_counter_get(struct devlink *devlink,
@@ -620,13 +864,19 @@ static int prestera_drop_counter_get(struct devlink *devlink,
 		PRESTERA_HW_CPU_CODE_CNT_TYPE_DROP;
 	struct prestera_trap *prestera_trap =
 		container_of(trap, struct prestera_trap, trap);
+	int ret;
 
-	return prestera_hw_cpu_code_counters_get(sw, prestera_trap->cpu_code,
-						 cpu_code_type, p_drops);
+	ret = prestera_hw_cpu_code_counters_get(sw, prestera_trap->cpu_code,
+						cpu_code_type, p_drops);
+	if (ret)
+		return ret;
+
+	return 0;
 }
 
 static void prestera_devlink_traps_fini(struct prestera_switch *sw)
 {
+	struct prestera_trap_data *trap_data = sw->trap_data;
 	struct devlink *dl = priv_to_devlink(sw);
 	const struct devlink_trap *trap;
 	int i;
@@ -638,4 +888,36 @@ static void prestera_devlink_traps_fini(struct prestera_switch *sw)
 
 	devlink_trap_groups_unregister(dl, prestera_trap_groups_arr,
 				       ARRAY_SIZE(prestera_trap_groups_arr));
+
+	kfree(trap_data->trap_items_arr);
+	kfree(trap_data);
 }
+#else
+static int prestera_devlink_traps_register(struct prestera_switch *sw)
+{
+	return 0;
+}
+
+static int prestera_trap_init(struct devlink *devlink,
+			      const struct devlink_trap *trap, void *trap_ctx)
+{
+	return 0;
+}
+
+static int prestera_trap_action_set(struct devlink *devlink,
+				    const struct devlink_trap *trap,
+				    enum devlink_trap_action action,
+				    struct netlink_ext_ack *extack)
+{
+	return 0;
+}
+
+static void prestera_devlink_traps_fini(struct prestera_switch *sw)
+{
+}
+
+void prestera_devlink_trap_report(struct prestera_port *port,
+				  struct sk_buff *skb, u8 cpu_code)
+{
+}
+#endif
