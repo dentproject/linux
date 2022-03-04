@@ -1,54 +1,22 @@
 // SPDX-License-Identifier: BSD-3-Clause OR GPL-2.0
-/* Copyright (c) 2019-2020 Marvell International Ltd. All rights reserved */
+/* Copyright (c) 2019-2021 Marvell International Ltd. All rights reserved */
 
-#include <linux/bitfield.h>
-#include <linux/circ_buf.h>
-#include <linux/device.h>
-#include <linux/firmware.h>
-#include <linux/iopoll.h>
-#include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/device.h>
 #include <linux/pci.h>
+#include <linux/circ_buf.h>
+#include <linux/firmware.h>
 
 #include "prestera.h"
+#include "prestera_fw.h"
 
-#define PRESTERA_MSG_MAX_SIZE 1500
+#define PRESTERA_FW_DEFAULT_PATH	"marvell/mvsw_prestera_fw.img"
+#define PRESTERA_FW_ARM64_PATH		"marvell/mvsw_prestera_fw_arm64.img"
 
-#define PRESTERA_SUPP_FW_MAJ_VER	3
-#define PRESTERA_SUPP_FW_MIN_VER	0
-
-#define PRESTERA_PREV_FW_MAJ_VER	2
-#define PRESTERA_PREV_FW_MIN_VER	0
-
-#define PRESTERA_FW_PATH_FMT	"mrvl/prestera/mvsw_prestera_fw-v%u.%u.img"
-
-#define PRESTERA_FW_HDR_MAGIC		0x351D9D06
-#define PRESTERA_FW_DL_TIMEOUT_MS	50000
-#define PRESTERA_FW_BLK_SZ		1024
-
-#define PRESTERA_FW_VER_MAJ_MUL 1000000
-#define PRESTERA_FW_VER_MIN_MUL 1000
-
-#define PRESTERA_FW_VER_MAJ(v)	((v) / PRESTERA_FW_VER_MAJ_MUL)
-
-#define PRESTERA_FW_VER_MIN(v) \
-	(((v) - (PRESTERA_FW_VER_MAJ(v) * PRESTERA_FW_VER_MAJ_MUL)) / \
-			PRESTERA_FW_VER_MIN_MUL)
-
-#define PRESTERA_FW_VER_PATCH(v) \
-	((v) - (PRESTERA_FW_VER_MAJ(v) * PRESTERA_FW_VER_MAJ_MUL) - \
-			(PRESTERA_FW_VER_MIN(v) * PRESTERA_FW_VER_MIN_MUL))
-
-enum prestera_pci_bar_t {
-	PRESTERA_PCI_BAR_FW = 2,
-	PRESTERA_PCI_BAR_PP = 4,
-};
-
-struct prestera_fw_header {
-	__be32 magic_number;
-	__be32 version_value;
-	u8 reserved[8];
-};
+#define PRESTERA_FW_HDR_MAGIC	0x351D9D06
+#define PRESTERA_FW_DL_TIMEOUT	50000
+#define PRESTERA_FW_BLK_SZ	1024
 
 struct prestera_ldr_regs {
 	u32 ldr_ready;
@@ -65,7 +33,7 @@ struct prestera_ldr_regs {
 	u32 ldr_buf_wr;
 
 	u32 ldr_status;
-};
+} __packed __aligned(4);
 
 #define PRESTERA_LDR_REG_OFFSET(f)	offsetof(struct prestera_ldr_regs, f)
 
@@ -76,8 +44,10 @@ struct prestera_ldr_regs {
 #define PRESTERA_LDR_STATUS_INVALID_IMG	BIT(2)
 #define PRESTERA_LDR_STATUS_NOMEM	BIT(3)
 
-#define PRESTERA_LDR_REG_BASE(fw)	((fw)->ldr_regs)
-#define PRESTERA_LDR_REG_ADDR(fw, reg)	(PRESTERA_LDR_REG_BASE(fw) + (reg))
+#define prestera_ldr_write(fw, reg, val) \
+	writel(val, (fw)->ldr_regs + (reg))
+#define prestera_ldr_read(fw, reg)	\
+	readl((fw)->ldr_regs + (reg))
 
 /* fw loader registers */
 #define PRESTERA_LDR_READY_REG		PRESTERA_LDR_REG_OFFSET(ldr_ready)
@@ -91,682 +61,382 @@ struct prestera_ldr_regs {
 
 #define PRESTERA_LDR_CTL_DL_START	BIT(0)
 
-#define PRESTERA_EVT_QNUM_MAX	4
+#define PRESTERA_LDR_WR_IDX_MOVE(fw, n) \
+do { \
+	typeof(fw) __fw = (fw); \
+	(__fw)->ldr_wr_idx = ((__fw)->ldr_wr_idx + (n)) & \
+				((__fw)->ldr_buf_len - 1); \
+} while (0)
 
-struct prestera_fw_evtq_regs {
-	u32 rd_idx;
-	u32 pad1;
-	u32 wr_idx;
-	u32 pad2;
-	u32 offs;
-	u32 len;
-};
+#define PRESTERA_LDR_WR_IDX_COMMIT(fw) \
+({ \
+	typeof(fw) __fw = (fw); \
+	prestera_ldr_write((__fw), PRESTERA_LDR_BUF_WR_REG, \
+			   (__fw)->ldr_wr_idx); \
+})
 
-struct prestera_fw_regs {
-	u32 fw_ready;
-	u32 pad;
-	u32 cmd_offs;
-	u32 cmd_len;
-	u32 evt_offs;
-	u32 evt_qnum;
+#define PRESTERA_LDR_WR_PTR(fw) \
+({ \
+	typeof(fw) __fw = (fw); \
+	((__fw)->ldr_ring_buf + (__fw)->ldr_wr_idx); \
+})
 
-	u32 cmd_req_ctl;
-	u32 cmd_req_len;
-	u32 cmd_rcv_ctl;
-	u32 cmd_rcv_len;
+#define PRESTERA_DEVICE(id) PCI_VDEVICE(MARVELL, (id))
 
-	u32 fw_status;
-	u32 rx_status;
+#define PRESTERA_DEV_ID_AC3X_98DX_55	0xC804
+#define PRESTERA_DEV_ID_AC3X_98DX_65	0xC80C
+#define PRESTERA_DEV_ID_ALDRIN2		0xCC1E
+#define PRESTERA_DEV_ID_ALDRIN3S	0x981F
+#define PRESTERA_DEV_ID_98DX3500	0x9820
+#define PRESTERA_DEV_ID_98DX3501	0x9826
+#define PRESTERA_DEV_ID_98DX3510	0x9821
+#define PRESTERA_DEV_ID_98DX3520	0x9822
 
-	struct prestera_fw_evtq_regs evtq_list[PRESTERA_EVT_QNUM_MAX];
-};
-
-#define PRESTERA_FW_REG_OFFSET(f)	offsetof(struct prestera_fw_regs, f)
-
-#define PRESTERA_FW_READY_MAGIC		0xcafebabe
-
-/* fw registers */
-#define PRESTERA_FW_READY_REG		PRESTERA_FW_REG_OFFSET(fw_ready)
-
-#define PRESTERA_CMD_BUF_OFFS_REG	PRESTERA_FW_REG_OFFSET(cmd_offs)
-#define PRESTERA_CMD_BUF_LEN_REG	PRESTERA_FW_REG_OFFSET(cmd_len)
-#define PRESTERA_EVT_BUF_OFFS_REG	PRESTERA_FW_REG_OFFSET(evt_offs)
-#define PRESTERA_EVT_QNUM_REG		PRESTERA_FW_REG_OFFSET(evt_qnum)
-
-#define PRESTERA_CMD_REQ_CTL_REG	PRESTERA_FW_REG_OFFSET(cmd_req_ctl)
-#define PRESTERA_CMD_REQ_LEN_REG	PRESTERA_FW_REG_OFFSET(cmd_req_len)
-
-#define PRESTERA_CMD_RCV_CTL_REG	PRESTERA_FW_REG_OFFSET(cmd_rcv_ctl)
-#define PRESTERA_CMD_RCV_LEN_REG	PRESTERA_FW_REG_OFFSET(cmd_rcv_len)
-#define PRESTERA_FW_STATUS_REG		PRESTERA_FW_REG_OFFSET(fw_status)
-#define PRESTERA_RX_STATUS_REG		PRESTERA_FW_REG_OFFSET(rx_status)
-
-/* PRESTERA_CMD_REQ_CTL_REG flags */
-#define PRESTERA_CMD_F_REQ_SENT		BIT(0)
-#define PRESTERA_CMD_F_REPL_RCVD	BIT(1)
-
-/* PRESTERA_CMD_RCV_CTL_REG flags */
-#define PRESTERA_CMD_F_REPL_SENT	BIT(0)
-
-#define PRESTERA_FW_EVT_CTL_STATUS_MASK	GENMASK(1, 0)
-
-#define PRESTERA_FW_EVT_CTL_STATUS_ON	0
-#define PRESTERA_FW_EVT_CTL_STATUS_OFF	1
-
-#define PRESTERA_EVTQ_REG_OFFSET(q, f)			\
-	(PRESTERA_FW_REG_OFFSET(evtq_list) +		\
-	 (q) * sizeof(struct prestera_fw_evtq_regs) +	\
-	 offsetof(struct prestera_fw_evtq_regs, f))
-
-#define PRESTERA_EVTQ_RD_IDX_REG(q)	PRESTERA_EVTQ_REG_OFFSET(q, rd_idx)
-#define PRESTERA_EVTQ_WR_IDX_REG(q)	PRESTERA_EVTQ_REG_OFFSET(q, wr_idx)
-#define PRESTERA_EVTQ_OFFS_REG(q)	PRESTERA_EVTQ_REG_OFFSET(q, offs)
-#define PRESTERA_EVTQ_LEN_REG(q)	PRESTERA_EVTQ_REG_OFFSET(q, len)
-
-#define PRESTERA_FW_REG_BASE(fw)	((fw)->dev.ctl_regs)
-#define PRESTERA_FW_REG_ADDR(fw, reg)	PRESTERA_FW_REG_BASE((fw)) + (reg)
-
-#define PRESTERA_FW_CMD_DEFAULT_WAIT_MS	30000
-#define PRESTERA_FW_READY_WAIT_MS	20000
-
-struct prestera_fw_evtq {
-	u8 __iomem *addr;
-	size_t len;
-};
-
-struct prestera_fw {
-	struct prestera_fw_rev rev_supp;
-	const struct firmware *bin;
-	struct workqueue_struct *wq;
-	struct prestera_device dev;
-	u8 __iomem *ldr_regs;
-	u8 __iomem *ldr_ring_buf;
-	u32 ldr_buf_len;
-	u32 ldr_wr_idx;
-	struct mutex cmd_mtx; /* serialize access to dev->send_req */
-	size_t cmd_mbox_len;
-	u8 __iomem *cmd_mbox;
-	struct prestera_fw_evtq evt_queue[PRESTERA_EVT_QNUM_MAX];
-	u8 evt_qnum;
-	struct work_struct evt_work;
-	u8 __iomem *evt_buf;
-	u8 *evt_msg;
+static struct prestera_pci_match {
+	struct pci_driver driver;
+	const struct pci_device_id id;
+	bool registered;
+} prestera_devices[] = {
+	{
+		.driver = { .name = "AC3x B2B 98DX3255", },
+		.id = { PRESTERA_DEVICE(PRESTERA_DEV_ID_AC3X_98DX_55), 0 },
+	},
+	{
+		.driver = { .name = "AC3x B2B 98DX3265", },
+		.id = { PRESTERA_DEVICE(PRESTERA_DEV_ID_AC3X_98DX_65), 0 },
+	},
+	{
+		.driver = { .name = "Aldrin2", },
+		.id = { PRESTERA_DEVICE(PRESTERA_DEV_ID_ALDRIN2), 0 },
+	},
+	{
+		.driver = { .name = "Aldrin3S", },
+		.id = { PRESTERA_DEVICE(PRESTERA_DEV_ID_ALDRIN3S), 0 },
+	},
+	{
+		.driver = { .name = "AC5X 98DX3500", },
+		.id = { PRESTERA_DEVICE(PRESTERA_DEV_ID_98DX3500), 0 },
+	},
+	{
+		.driver = { .name = "AC5X 98DX3501", },
+		.id = { PRESTERA_DEVICE(PRESTERA_DEV_ID_98DX3501), 0 },
+	},
+	{
+		.driver = { .name = "AC5X 98DX3510", },
+		.id = { PRESTERA_DEVICE(PRESTERA_DEV_ID_98DX3510), 0 },
+	},
+	{
+		.driver = { .name = "AC5X 98DX3520", },
+		.id = { PRESTERA_DEVICE(PRESTERA_DEV_ID_98DX3520), 0 },
+	},
+	{{ }, }
 };
 
 static int prestera_fw_load(struct prestera_fw *fw);
 
-static void prestera_fw_write(struct prestera_fw *fw, u32 reg, u32 val)
-{
-	writel(val, PRESTERA_FW_REG_ADDR(fw, reg));
-}
-
-static u32 prestera_fw_read(struct prestera_fw *fw, u32 reg)
-{
-	return readl(PRESTERA_FW_REG_ADDR(fw, reg));
-}
-
-static u32 prestera_fw_evtq_len(struct prestera_fw *fw, u8 qid)
-{
-	return fw->evt_queue[qid].len;
-}
-
-static u32 prestera_fw_evtq_avail(struct prestera_fw *fw, u8 qid)
-{
-	u32 wr_idx = prestera_fw_read(fw, PRESTERA_EVTQ_WR_IDX_REG(qid));
-	u32 rd_idx = prestera_fw_read(fw, PRESTERA_EVTQ_RD_IDX_REG(qid));
-
-	return CIRC_CNT(wr_idx, rd_idx, prestera_fw_evtq_len(fw, qid));
-}
-
-static void prestera_fw_evtq_rd_set(struct prestera_fw *fw,
-				    u8 qid, u32 idx)
-{
-	u32 rd_idx = idx & (prestera_fw_evtq_len(fw, qid) - 1);
-
-	prestera_fw_write(fw, PRESTERA_EVTQ_RD_IDX_REG(qid), rd_idx);
-}
-
-static u8 __iomem *prestera_fw_evtq_buf(struct prestera_fw *fw, u8 qid)
-{
-	return fw->evt_queue[qid].addr;
-}
-
-static u32 prestera_fw_evtq_read32(struct prestera_fw *fw, u8 qid)
-{
-	u32 rd_idx = prestera_fw_read(fw, PRESTERA_EVTQ_RD_IDX_REG(qid));
-	u32 val;
-
-	val = readl(prestera_fw_evtq_buf(fw, qid) + rd_idx);
-	prestera_fw_evtq_rd_set(fw, qid, rd_idx + 4);
-	return val;
-}
-
-static ssize_t prestera_fw_evtq_read_buf(struct prestera_fw *fw,
-					 u8 qid, void *buf, size_t len)
-{
-	u32 idx = prestera_fw_read(fw, PRESTERA_EVTQ_RD_IDX_REG(qid));
-	u8 __iomem *evtq_addr = prestera_fw_evtq_buf(fw, qid);
-	u32 *buf32 = buf;
-	int i;
-
-	for (i = 0; i < len / 4; buf32++, i++) {
-		*buf32 = readl_relaxed(evtq_addr + idx);
-		idx = (idx + 4) & (prestera_fw_evtq_len(fw, qid) - 1);
-	}
-
-	prestera_fw_evtq_rd_set(fw, qid, idx);
-
-	return i;
-}
-
-static u8 prestera_fw_evtq_pick(struct prestera_fw *fw)
-{
-	int qid;
-
-	for (qid = 0; qid < fw->evt_qnum; qid++) {
-		if (prestera_fw_evtq_avail(fw, qid) >= 4)
-			return qid;
-	}
-
-	return PRESTERA_EVT_QNUM_MAX;
-}
-
-static void prestera_fw_evt_ctl_status_set(struct prestera_fw *fw, u32 val)
-{
-	u32 status = prestera_fw_read(fw, PRESTERA_FW_STATUS_REG);
-
-	u32p_replace_bits(&status, val, PRESTERA_FW_EVT_CTL_STATUS_MASK);
-
-	prestera_fw_write(fw, PRESTERA_FW_STATUS_REG, status);
-}
-
-static void prestera_fw_evt_work_fn(struct work_struct *work)
-{
-	struct prestera_fw *fw;
-	void *msg;
-	u8 qid;
-
-	fw = container_of(work, struct prestera_fw, evt_work);
-	msg = fw->evt_msg;
-
-	prestera_fw_evt_ctl_status_set(fw, PRESTERA_FW_EVT_CTL_STATUS_OFF);
-
-	while ((qid = prestera_fw_evtq_pick(fw)) < PRESTERA_EVT_QNUM_MAX) {
-		u32 idx;
-		u32 len;
-
-		len = prestera_fw_evtq_read32(fw, qid);
-		idx = prestera_fw_read(fw, PRESTERA_EVTQ_RD_IDX_REG(qid));
-
-		WARN_ON(prestera_fw_evtq_avail(fw, qid) < len);
-
-		if (WARN_ON(len > PRESTERA_MSG_MAX_SIZE)) {
-			prestera_fw_evtq_rd_set(fw, qid, idx + len);
-			continue;
-		}
-
-		prestera_fw_evtq_read_buf(fw, qid, msg, len);
-
-		if (fw->dev.recv_msg)
-			fw->dev.recv_msg(&fw->dev, msg, len);
-	}
-
-	prestera_fw_evt_ctl_status_set(fw, PRESTERA_FW_EVT_CTL_STATUS_ON);
-}
-
-static int prestera_fw_wait_reg32(struct prestera_fw *fw, u32 reg, u32 cmp,
-				  unsigned int waitms)
-{
-	u8 __iomem *addr = PRESTERA_FW_REG_ADDR(fw, reg);
-	u32 val;
-
-	return readl_poll_timeout(addr, val, cmp == val,
-				  1 * USEC_PER_MSEC, waitms * USEC_PER_MSEC);
-}
-
-static int prestera_fw_cmd_send(struct prestera_fw *fw,
-				void *in_msg, size_t in_size,
-				void *out_msg, size_t out_size,
-				unsigned int waitms)
-{
-	u32 ret_size;
-	int err;
-
-	if (!waitms)
-		waitms = PRESTERA_FW_CMD_DEFAULT_WAIT_MS;
-
-	if (ALIGN(in_size, 4) > fw->cmd_mbox_len)
-		return -EMSGSIZE;
-
-	/* wait for finish previous reply from FW */
-	err = prestera_fw_wait_reg32(fw, PRESTERA_CMD_RCV_CTL_REG, 0, 30);
-	if (err) {
-		dev_err(fw->dev.dev, "finish reply from FW is timed out\n");
-		return err;
-	}
-
-	prestera_fw_write(fw, PRESTERA_CMD_REQ_LEN_REG, in_size);
-	memcpy_toio(fw->cmd_mbox, in_msg, in_size);
-
-	prestera_fw_write(fw, PRESTERA_CMD_REQ_CTL_REG, PRESTERA_CMD_F_REQ_SENT);
-
-	/* wait for reply from FW */
-	err = prestera_fw_wait_reg32(fw, PRESTERA_CMD_RCV_CTL_REG,
-				     PRESTERA_CMD_F_REPL_SENT, waitms);
-	if (err) {
-		dev_err(fw->dev.dev, "reply from FW is timed out\n");
-		goto cmd_exit;
-	}
-
-	ret_size = prestera_fw_read(fw, PRESTERA_CMD_RCV_LEN_REG);
-	if (ret_size > out_size) {
-		dev_err(fw->dev.dev, "ret_size (%u) > out_len(%zu)\n",
-			ret_size, out_size);
-		err = -EMSGSIZE;
-		goto cmd_exit;
-	}
-
-	memcpy_fromio(out_msg, fw->cmd_mbox + in_size, ret_size);
-
-cmd_exit:
-	prestera_fw_write(fw, PRESTERA_CMD_REQ_CTL_REG, PRESTERA_CMD_F_REPL_RCVD);
-	return err;
-}
-
-static int prestera_fw_send_req(struct prestera_device *dev,
-				void *in_msg, size_t in_size, void *out_msg,
-				size_t out_size, unsigned int waitms)
-{
-	struct prestera_fw *fw;
-	ssize_t ret;
-
-	fw = container_of(dev, struct prestera_fw, dev);
-
-	mutex_lock(&fw->cmd_mtx);
-	ret = prestera_fw_cmd_send(fw, in_msg, in_size, out_msg, out_size, waitms);
-	mutex_unlock(&fw->cmd_mtx);
-
-	return ret;
-}
-
-static int prestera_fw_init(struct prestera_fw *fw)
-{
-	u8 __iomem *base;
-	int err;
-	u8 qid;
-
-	fw->dev.send_req = prestera_fw_send_req;
-	fw->ldr_regs = fw->dev.ctl_regs;
-
-	err = prestera_fw_load(fw);
-	if (err)
-		return err;
-
-	err = prestera_fw_wait_reg32(fw, PRESTERA_FW_READY_REG,
-				     PRESTERA_FW_READY_MAGIC,
-				     PRESTERA_FW_READY_WAIT_MS);
-	if (err) {
-		dev_err(fw->dev.dev, "FW failed to start\n");
-		return err;
-	}
-
-	base = fw->dev.ctl_regs;
-
-	fw->cmd_mbox = base + prestera_fw_read(fw, PRESTERA_CMD_BUF_OFFS_REG);
-	fw->cmd_mbox_len = prestera_fw_read(fw, PRESTERA_CMD_BUF_LEN_REG);
-	mutex_init(&fw->cmd_mtx);
-
-	fw->evt_buf = base + prestera_fw_read(fw, PRESTERA_EVT_BUF_OFFS_REG);
-	fw->evt_qnum = prestera_fw_read(fw, PRESTERA_EVT_QNUM_REG);
-	fw->evt_msg = kmalloc(PRESTERA_MSG_MAX_SIZE, GFP_KERNEL);
-	if (!fw->evt_msg)
-		return -ENOMEM;
-
-	for (qid = 0; qid < fw->evt_qnum; qid++) {
-		u32 offs = prestera_fw_read(fw, PRESTERA_EVTQ_OFFS_REG(qid));
-		struct prestera_fw_evtq *evtq = &fw->evt_queue[qid];
-
-		evtq->len = prestera_fw_read(fw, PRESTERA_EVTQ_LEN_REG(qid));
-		evtq->addr = fw->evt_buf + offs;
-	}
-
-	return 0;
-}
-
-static void prestera_fw_uninit(struct prestera_fw *fw)
-{
-	kfree(fw->evt_msg);
-}
-
-static irqreturn_t prestera_pci_irq_handler(int irq, void *dev_id)
+static irqreturn_t prestera_irq_handler(int irq, void *dev_id)
 {
 	struct prestera_fw *fw = dev_id;
 
 	if (prestera_fw_read(fw, PRESTERA_RX_STATUS_REG)) {
-		prestera_fw_write(fw, PRESTERA_RX_STATUS_REG, 0);
-
-		if (fw->dev.recv_pkt)
+		if (fw->dev.recv_pkt) {
+			prestera_fw_write(fw, PRESTERA_RX_STATUS_REG, 0);
 			fw->dev.recv_pkt(&fw->dev);
+		}
 	}
 
-	queue_work(fw->wq, &fw->evt_work);
+	prestera_fw_queue_work(fw);
 
 	return IRQ_HANDLED;
 }
 
-static void prestera_ldr_write(struct prestera_fw *fw, u32 reg, u32 val)
+static int prestera_ldr_wait_reg32(struct prestera_fw *fw, u32 reg, u32 val,
+				   unsigned int wait)
 {
-	writel(val, PRESTERA_LDR_REG_ADDR(fw, reg));
+	if (prestera_wait(prestera_ldr_read(fw, reg) == val, wait))
+		return 0;
+
+	return -EBUSY;
 }
 
-static u32 prestera_ldr_read(struct prestera_fw *fw, u32 reg)
+static u32 prestera_ldr_buf_avail(struct prestera_fw *fw)
 {
-	return readl(PRESTERA_LDR_REG_ADDR(fw, reg));
+	u32 rd_idx = prestera_ldr_read(fw, PRESTERA_LDR_BUF_RD_REG);
+
+	return CIRC_SPACE(fw->ldr_wr_idx, rd_idx, fw->ldr_buf_len);
 }
 
-static int prestera_ldr_wait_reg32(struct prestera_fw *fw,
-				   u32 reg, u32 cmp, unsigned int waitms)
+static int prestera_ldr_send_buf(struct prestera_fw *fw, const u8 *buf,
+				 size_t len)
 {
-	u8 __iomem *addr = PRESTERA_LDR_REG_ADDR(fw, reg);
-	u32 val;
-
-	return readl_poll_timeout(addr, val, cmp == val,
-				  10 * USEC_PER_MSEC, waitms * USEC_PER_MSEC);
-}
-
-static u32 prestera_ldr_wait_buf(struct prestera_fw *fw, size_t len)
-{
-	u8 __iomem *addr = PRESTERA_LDR_REG_ADDR(fw, PRESTERA_LDR_BUF_RD_REG);
-	u32 buf_len = fw->ldr_buf_len;
-	u32 wr_idx = fw->ldr_wr_idx;
-	u32 rd_idx;
-
-	return readl_poll_timeout(addr, rd_idx,
-				 CIRC_SPACE(wr_idx, rd_idx, buf_len) >= len,
-				 1 * USEC_PER_MSEC, 100 * USEC_PER_MSEC);
-}
-
-static int prestera_ldr_wait_dl_finish(struct prestera_fw *fw)
-{
-	u8 __iomem *addr = PRESTERA_LDR_REG_ADDR(fw, PRESTERA_LDR_STATUS_REG);
-	unsigned long mask = ~(PRESTERA_LDR_STATUS_IMG_DL);
-	u32 val;
-	int err;
-
-	err = readl_poll_timeout(addr, val, val & mask, 10 * USEC_PER_MSEC,
-				 PRESTERA_FW_DL_TIMEOUT_MS * USEC_PER_MSEC);
-	if (err) {
-		dev_err(fw->dev.dev, "Timeout to load FW img [state=%d]",
-			prestera_ldr_read(fw, PRESTERA_LDR_STATUS_REG));
-		return err;
-	}
-
-	return 0;
-}
-
-static void prestera_ldr_wr_idx_move(struct prestera_fw *fw, unsigned int n)
-{
-	fw->ldr_wr_idx = (fw->ldr_wr_idx + (n)) & (fw->ldr_buf_len - 1);
-}
-
-static void prestera_ldr_wr_idx_commit(struct prestera_fw *fw)
-{
-	prestera_ldr_write(fw, PRESTERA_LDR_BUF_WR_REG, fw->ldr_wr_idx);
-}
-
-static u8 __iomem *prestera_ldr_wr_ptr(struct prestera_fw *fw)
-{
-	return fw->ldr_ring_buf + fw->ldr_wr_idx;
-}
-
-static int prestera_ldr_send(struct prestera_fw *fw, const u8 *buf, size_t len)
-{
-	int err;
 	int i;
 
-	err = prestera_ldr_wait_buf(fw, len);
-	if (err) {
-		dev_err(fw->dev.dev, "failed wait for sending firmware\n");
-		return err;
+	if (!prestera_wait(prestera_ldr_buf_avail(fw) >= len, 100)) {
+		dev_err(prestera_fw_dev(fw),
+			"failed wait for sending firmware\n");
+		return -EBUSY;
 	}
 
 	for (i = 0; i < len; i += 4) {
-		writel_relaxed(*(u32 *)(buf + i), prestera_ldr_wr_ptr(fw));
-		prestera_ldr_wr_idx_move(fw, 4);
+		writel_relaxed(*(u32 *)(buf + i), PRESTERA_LDR_WR_PTR(fw));
+		PRESTERA_LDR_WR_IDX_MOVE(fw, 4);
 	}
 
-	prestera_ldr_wr_idx_commit(fw);
+	PRESTERA_LDR_WR_IDX_COMMIT(fw);
 	return 0;
 }
 
-static int prestera_ldr_fw_send(struct prestera_fw *fw,
-				const char *img, u32 fw_size)
+static int prestera_ldr_send(struct prestera_fw *fw, const char *img,
+			     u32 fw_size)
 {
+	unsigned long mask;
 	u32 status;
 	u32 pos;
 	int err;
 
-	err = prestera_ldr_wait_reg32(fw, PRESTERA_LDR_STATUS_REG,
-				      PRESTERA_LDR_STATUS_IMG_DL,
-				      5 * MSEC_PER_SEC);
-	if (err) {
-		dev_err(fw->dev.dev, "Loader is not ready to load image\n");
-		return err;
+	if (prestera_ldr_wait_reg32(fw, PRESTERA_LDR_STATUS_REG,
+				    PRESTERA_LDR_STATUS_IMG_DL, 1000)) {
+		dev_err(prestera_fw_dev(fw),
+			"Loader is not ready to load image\n");
+		return -EBUSY;
 	}
 
 	for (pos = 0; pos < fw_size; pos += PRESTERA_FW_BLK_SZ) {
 		if (pos + PRESTERA_FW_BLK_SZ > fw_size)
 			break;
 
-		err = prestera_ldr_send(fw, img + pos, PRESTERA_FW_BLK_SZ);
-		if (err)
+		err = prestera_ldr_send_buf(fw, img + pos, PRESTERA_FW_BLK_SZ);
+		if (err) {
+			if (prestera_fw_read(fw, PRESTERA_LDR_STATUS_REG) ==
+					     PRESTERA_LDR_STATUS_NOMEM) {
+				dev_err(prestera_fw_dev(fw),
+					"Fw image is too big or invalid\n");
+				return -EINVAL;
+			}
 			return err;
+		}
 	}
 
 	if (pos < fw_size) {
-		err = prestera_ldr_send(fw, img + pos, fw_size - pos);
+		err = prestera_ldr_send_buf(fw, img + pos, fw_size - pos);
 		if (err)
 			return err;
 	}
 
-	err = prestera_ldr_wait_dl_finish(fw);
-	if (err)
-		return err;
+	/* Waiting for status IMG_DOWNLOADING to change to something else */
+	mask = ~(PRESTERA_LDR_STATUS_IMG_DL);
+
+	if (!prestera_wait(prestera_ldr_read(fw, PRESTERA_LDR_STATUS_REG) &
+			   mask, PRESTERA_FW_DL_TIMEOUT)) {
+		dev_err(prestera_fw_dev(fw),
+			"Timeout to load FW img [state=%d]",
+			prestera_ldr_read(fw, PRESTERA_LDR_STATUS_REG));
+		return -ETIMEDOUT;
+	}
 
 	status = prestera_ldr_read(fw, PRESTERA_LDR_STATUS_REG);
-
-	switch (status) {
-	case PRESTERA_LDR_STATUS_INVALID_IMG:
-		dev_err(fw->dev.dev, "FW img has bad CRC\n");
-		return -EINVAL;
-	case PRESTERA_LDR_STATUS_NOMEM:
-		dev_err(fw->dev.dev, "Loader has no enough mem\n");
-		return -ENOMEM;
+	if (status != PRESTERA_LDR_STATUS_START_FW) {
+		switch (status) {
+		case PRESTERA_LDR_STATUS_INVALID_IMG:
+			dev_err(prestera_fw_dev(fw), "FW img has bad crc\n");
+			return -EINVAL;
+		case PRESTERA_LDR_STATUS_NOMEM:
+			dev_err(prestera_fw_dev(fw),
+				"Loader has no enough mem\n");
+			return -ENOMEM;
+		default:
+			break;
+		}
 	}
 
 	return 0;
 }
 
-static void prestera_fw_rev_parse(const struct prestera_fw_header *hdr,
-				  struct prestera_fw_rev *rev)
+static bool prestera_ldr_is_ready(struct prestera_fw *fw)
 {
-	u32 version = be32_to_cpu(hdr->version_value);
-
-	rev->maj = PRESTERA_FW_VER_MAJ(version);
-	rev->min = PRESTERA_FW_VER_MIN(version);
-	rev->sub = PRESTERA_FW_VER_PATCH(version);
+	return prestera_ldr_read(fw, PRESTERA_LDR_READY_REG) ==
+				 PRESTERA_LDR_READY_MAGIC;
 }
 
-static int prestera_fw_rev_check(struct prestera_fw *fw)
+static int prestera_fw_hdr_parse(struct prestera_fw *fw,
+				 const struct firmware *img)
 {
+	struct prestera_fw_header *hdr = (struct prestera_fw_header *)img->data;
 	struct prestera_fw_rev *rev = &fw->dev.fw_rev;
-
-	if (rev->maj == fw->rev_supp.maj && rev->min >= fw->rev_supp.min)
-		return 0;
-
-	dev_err(fw->dev.dev, "Driver supports FW version only '%u.%u.x'",
-		fw->rev_supp.maj, fw->rev_supp.min);
-
-	return -EINVAL;
-}
-
-static int prestera_fw_hdr_parse(struct prestera_fw *fw)
-{
-	struct prestera_fw_rev *rev = &fw->dev.fw_rev;
-	struct prestera_fw_header *hdr;
 	u32 magic;
-
-	hdr = (struct prestera_fw_header *)fw->bin->data;
 
 	magic = be32_to_cpu(hdr->magic_number);
 	if (magic != PRESTERA_FW_HDR_MAGIC) {
-		dev_err(fw->dev.dev, "FW img hdr magic is invalid");
+		dev_err(prestera_fw_dev(fw), "FW img type is invalid");
 		return -EINVAL;
 	}
 
 	prestera_fw_rev_parse(hdr, rev);
 
-	dev_info(fw->dev.dev, "FW version '%u.%u.%u'\n",
-		 rev->maj, rev->min, rev->sub);
-
 	return prestera_fw_rev_check(fw);
 }
 
-static int prestera_fw_get(struct prestera_fw *fw)
+static const char *prestera_fw_path_get(struct prestera_fw *fw)
 {
-	int ver_maj = PRESTERA_SUPP_FW_MAJ_VER;
-	int ver_min = PRESTERA_SUPP_FW_MIN_VER;
-	char fw_path[128];
-	int err;
+	switch (fw->pci_dev->device) {
+	case PRESTERA_DEV_ID_98DX3500:
+	case PRESTERA_DEV_ID_98DX3501:
+	case PRESTERA_DEV_ID_98DX3510:
+	case PRESTERA_DEV_ID_98DX3520:
+		return PRESTERA_FW_ARM64_PATH;
 
-pick_fw_ver:
-	snprintf(fw_path, sizeof(fw_path), PRESTERA_FW_PATH_FMT,
-		 ver_maj, ver_min);
-
-	err = request_firmware_direct(&fw->bin, fw_path, fw->dev.dev);
-	if (err) {
-		if (ver_maj == PRESTERA_SUPP_FW_MAJ_VER) {
-			ver_maj = PRESTERA_PREV_FW_MAJ_VER;
-			ver_min = PRESTERA_PREV_FW_MIN_VER;
-
-			dev_warn(fw->dev.dev,
-				 "missing latest %s firmware, fall-back to previous %u.%u version\n",
-				 fw_path, ver_maj, ver_min);
-
-			goto pick_fw_ver;
-		} else {
-			dev_err(fw->dev.dev, "failed to request previous firmware: %s\n",
-				fw_path);
-			return err;
-		}
+	default:
+		return PRESTERA_FW_DEFAULT_PATH;
 	}
-
-	dev_info(fw->dev.dev, "Loading %s ...", fw_path);
-
-	fw->rev_supp.maj = ver_maj;
-	fw->rev_supp.min = ver_min;
-	fw->rev_supp.sub = 0;
-
-	return 0;
-}
-
-static void prestera_fw_put(struct prestera_fw *fw)
-{
-	release_firmware(fw->bin);
 }
 
 static int prestera_fw_load(struct prestera_fw *fw)
 {
 	size_t hlen = sizeof(struct prestera_fw_header);
+	const char *fw_path = prestera_fw_path_get(fw);
+	const struct firmware *f;
+	bool has_ldr;
 	int err;
 
-	err = prestera_ldr_wait_reg32(fw, PRESTERA_LDR_READY_REG,
-				      PRESTERA_LDR_READY_MAGIC,
-				      5 * MSEC_PER_SEC);
-	if (err) {
-		dev_err(fw->dev.dev, "waiting for FW loader is timed out");
-		return err;
+	/* 10s delay is required for soft reset feature */
+	has_ldr = prestera_wait(prestera_ldr_is_ready(fw), 15000);
+	if (!has_ldr) {
+		dev_err(prestera_fw_dev(fw),
+			"waiting for FW loader is timed out");
+		return -ETIMEDOUT;
 	}
 
 	fw->ldr_ring_buf = fw->ldr_regs +
 		prestera_ldr_read(fw, PRESTERA_LDR_BUF_OFFS_REG);
 
-	fw->ldr_buf_len =
-		prestera_ldr_read(fw, PRESTERA_LDR_BUF_SIZE_REG);
+	fw->ldr_buf_len = prestera_ldr_read(fw, PRESTERA_LDR_BUF_SIZE_REG);
 
 	fw->ldr_wr_idx = 0;
 
-	err = prestera_fw_get(fw);
-	if (err)
-		return err;
-
-	err = prestera_fw_hdr_parse(fw);
+	err = request_firmware_direct(&f, fw_path, &fw->pci_dev->dev);
 	if (err) {
-		dev_err(fw->dev.dev, "FW image header is invalid\n");
-		goto out_release;
+		dev_err(prestera_fw_dev(fw),
+			"failed to request firmware file: %s\n", fw_path);
+		return err;
 	}
 
-	prestera_ldr_write(fw, PRESTERA_LDR_IMG_SIZE_REG, fw->bin->size - hlen);
+	if (!IS_ALIGNED(f->size, 4)) {
+		dev_err(prestera_fw_dev(fw), "FW image file is not aligned");
+		release_firmware(f);
+		return -EINVAL;
+	}
+
+	err = prestera_fw_hdr_parse(fw, f);
+	if (err) {
+		dev_err(prestera_fw_dev(fw), "FW image is invalid\n");
+		release_firmware(f);
+		return err;
+	}
+
+	prestera_ldr_write(fw, PRESTERA_LDR_IMG_SIZE_REG, f->size - hlen);
 	prestera_ldr_write(fw, PRESTERA_LDR_CTL_REG, PRESTERA_LDR_CTL_DL_START);
 
-	err = prestera_ldr_fw_send(fw, fw->bin->data + hlen,
-				   fw->bin->size - hlen);
+	dev_info(prestera_fw_dev(fw), "Loading prestera FW image ...");
 
-out_release:
-	prestera_fw_put(fw);
+	err = prestera_ldr_send(fw, f->data + hlen, f->size - hlen);
+
+	release_firmware(f);
 	return err;
+}
+
+static bool prestera_pci_pp_use_bar2(struct pci_dev *pdev)
+{
+	switch (pdev->device) {
+	case PRESTERA_DEV_ID_ALDRIN3S:
+	case PRESTERA_DEV_ID_98DX3500:
+	case PRESTERA_DEV_ID_98DX3501:
+	case PRESTERA_DEV_ID_98DX3510:
+	case PRESTERA_DEV_ID_98DX3520:
+		return true;
+
+	default:
+		return false;
+	}
+}
+
+static u32 prestera_pci_pp_bar2_offs(struct pci_dev *pdev)
+{
+	if (pci_resource_len(pdev, 2) == 0x1000000)
+		return 0x0;
+	else
+		return (pci_resource_len(pdev, 2) / 2);
+}
+
+static u32 prestera_pci_fw_bar2_offs(struct pci_dev *pdev)
+{
+	if (pci_resource_len(pdev, 2) == 0x1000000)
+		return 0x400000;
+	else
+		return 0x0;
 }
 
 static int prestera_pci_probe(struct pci_dev *pdev,
 			      const struct pci_device_id *id)
 {
 	const char *driver_name = pdev->driver->name;
+	u8 __iomem *mem_addr, *pp_addr = NULL;
 	struct prestera_fw *fw;
 	int err;
 
-	err = pcim_enable_device(pdev);
-	if (err)
-		return err;
-
-	err = pcim_iomap_regions(pdev, BIT(PRESTERA_PCI_BAR_FW) |
-				 BIT(PRESTERA_PCI_BAR_PP),
-				 pci_name(pdev));
-	if (err)
-		return err;
-
-	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(30));
+	err = pci_enable_device(pdev);
 	if (err) {
+		dev_err(&pdev->dev, "pci_enable_device failed\n");
+		goto err_pci_enable_device;
+	}
+
+	err = pci_request_regions(pdev, driver_name);
+	if (err) {
+		dev_err(&pdev->dev, "pci_request_regions failed\n");
+		goto err_pci_request_regions;
+	}
+
+	if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(30))) {
 		dev_err(&pdev->dev, "fail to set DMA mask\n");
 		goto err_dma_mask;
 	}
 
+	mem_addr = pcim_iomap(pdev, 2, 0);
+	if (!mem_addr) {
+		dev_err(&pdev->dev, "pci mem ioremap failed\n");
+		err = -EIO;
+		goto err_mem_ioremap;
+	}
+
+	/* Aldrin3S uses second half of BAR2 */
+	if (prestera_pci_pp_use_bar2(pdev)) {
+		pp_addr = mem_addr + prestera_pci_pp_bar2_offs(pdev);
+		mem_addr = mem_addr + prestera_pci_fw_bar2_offs(pdev);
+	} else {
+		pp_addr = pcim_iomap(pdev, 4, 0);
+		if (!pp_addr) {
+			dev_err(&pdev->dev, "pp regs ioremap failed\n");
+			err = -EIO;
+			goto err_pp_ioremap;
+		}
+	}
+
 	pci_set_master(pdev);
 
-	fw = devm_kzalloc(&pdev->dev, sizeof(*fw), GFP_KERNEL);
+	fw = kzalloc(sizeof(*fw), GFP_KERNEL);
 	if (!fw) {
 		err = -ENOMEM;
 		goto err_pci_dev_alloc;
 	}
 
-	fw->dev.ctl_regs = pcim_iomap_table(pdev)[PRESTERA_PCI_BAR_FW];
-	fw->dev.pp_regs = pcim_iomap_table(pdev)[PRESTERA_PCI_BAR_PP];
+	fw->pci_dev = pdev;
 	fw->dev.dev = &pdev->dev;
-
-	pci_set_drvdata(pdev, fw);
-
-	err = prestera_fw_init(fw);
-	if (err)
-		goto err_prestera_fw_init;
-
-	dev_info(fw->dev.dev, "Prestera FW is ready\n");
-
-	fw->wq = alloc_workqueue("prestera_fw_wq", WQ_HIGHPRI, 1);
-	if (!fw->wq) {
-		err = -ENOMEM;
-		goto err_wq_alloc;
-	}
-
-	INIT_WORK(&fw->evt_work, prestera_fw_evt_work_fn);
+	fw->dev.send_req = prestera_fw_send_req;
+	fw->dev.pp_regs = pp_addr;
+	fw->dev.dma_flags = GFP_DMA;
+	fw->dev.running = true;
+	fw->mem_addr = mem_addr;
+	fw->ldr_regs = mem_addr;
+	fw->hw_regs = mem_addr;
 
 	err = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
 	if (err < 0) {
@@ -774,12 +444,25 @@ static int prestera_pci_probe(struct pci_dev *pdev,
 		goto err_irq_alloc;
 	}
 
-	err = request_irq(pci_irq_vector(pdev, 0), prestera_pci_irq_handler,
+	pci_set_drvdata(pdev, fw);
+
+	err = prestera_fw_load(fw);
+
+	if (err)
+		goto err_fw_init;
+
+	err = prestera_fw_init(fw);
+	if (err)
+		goto err_fw_init;
+
+	err = request_irq(pci_irq_vector(pdev, 0), prestera_irq_handler,
 			  0, driver_name, fw);
 	if (err) {
 		dev_err(&pdev->dev, "fail to request IRQ\n");
 		goto err_request_irq;
 	}
+
+	dev_info(prestera_fw_dev(fw), "Prestera Switch FW is ready\n");
 
 	err = prestera_device_register(&fw->dev);
 	if (err)
@@ -790,14 +473,19 @@ static int prestera_pci_probe(struct pci_dev *pdev,
 err_prestera_dev_register:
 	free_irq(pci_irq_vector(pdev, 0), fw);
 err_request_irq:
+	prestera_fw_uninit(fw);
+err_fw_init:
 	pci_free_irq_vectors(pdev);
 err_irq_alloc:
-	destroy_workqueue(fw->wq);
-err_wq_alloc:
-	prestera_fw_uninit(fw);
-err_prestera_fw_init:
+
 err_pci_dev_alloc:
+err_pp_ioremap:
+err_mem_ioremap:
 err_dma_mask:
+	pci_release_regions(pdev);
+err_pci_request_regions:
+	pci_disable_device(pdev);
+err_pci_enable_device:
 	return err;
 }
 
@@ -805,27 +493,67 @@ static void prestera_pci_remove(struct pci_dev *pdev)
 {
 	struct prestera_fw *fw = pci_get_drvdata(pdev);
 
-	prestera_device_unregister(&fw->dev);
 	free_irq(pci_irq_vector(pdev, 0), fw);
 	pci_free_irq_vectors(pdev);
-	destroy_workqueue(fw->wq);
+	prestera_device_unregister(&fw->dev);
 	prestera_fw_uninit(fw);
+	pci_release_regions(pdev);
+	pci_disable_device(pdev);
+	kfree(fw);
 }
 
-static const struct pci_device_id prestera_pci_devices[] = {
-	{ PCI_DEVICE(PCI_VENDOR_ID_MARVELL, 0xC804) },
-	{ PCI_DEVICE(PCI_VENDOR_ID_MARVELL, 0xC80C) },
-	{ }
-};
-MODULE_DEVICE_TABLE(pci, prestera_pci_devices);
+static int __init prestera_pci_init(void)
+{
+	struct prestera_pci_match *match;
+	int err = 0;
 
-static struct pci_driver prestera_pci_driver = {
-	.name     = "Prestera DX",
-	.id_table = prestera_pci_devices,
-	.probe    = prestera_pci_probe,
-	.remove   = prestera_pci_remove,
-};
-module_pci_driver(prestera_pci_driver);
+	for (match = prestera_devices; match->driver.name; match++) {
+		match->driver.probe = prestera_pci_probe;
+		match->driver.remove = prestera_pci_remove;
+		match->driver.id_table = &match->id;
 
-MODULE_LICENSE("Dual BSD/GPL");
+		err = pci_register_driver(&match->driver);
+		if (err) {
+			pr_err("prestera_pci: failed to register %s\n",
+			       match->driver.name);
+			break;
+		}
+
+		match->registered = true;
+	}
+
+	if (err) {
+		for (match = prestera_devices; match->driver.name; match++) {
+			if (!match->registered)
+				break;
+
+			pci_unregister_driver(&match->driver);
+		}
+
+		return err;
+	}
+
+	pr_info("prestera_pci: Registered Marvell Prestera PCI driver\n");
+	return 0;
+}
+
+static void __exit prestera_pci_exit(void)
+{
+	struct prestera_pci_match *match;
+
+	for (match = prestera_devices; match->driver.name; match++) {
+		if (!match->registered)
+			break;
+
+		pci_unregister_driver(&match->driver);
+	}
+
+	pr_info("prestera_pci: Unregistered Marvell Prestera PCI driver\n");
+}
+
+module_init(prestera_pci_init);
+module_exit(prestera_pci_exit);
+
+MODULE_AUTHOR("Marvell Semi.");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Marvell Prestera switch PCI interface");
