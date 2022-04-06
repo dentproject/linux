@@ -84,6 +84,7 @@ int nand_bbm_get_next_page(struct nand_chip *chip, int page);
 int nand_markbad_bbm(struct nand_chip *chip, loff_t ofs);
 int nand_erase_nand(struct nand_chip *chip, struct erase_info *instr,
 		    int allowbbt);
+const struct nand_sdr_timings *onfi_async_timing_mode_to_sdr_timings(int mode);
 void onfi_fill_interface_config(struct nand_chip *chip,
 				struct nand_interface_config *iface,
 				enum nand_interface_type type,

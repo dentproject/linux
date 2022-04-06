@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0
 # Mvebu SoC Family
+dtb-$(CONFIG_ARCH_MVEBU) += ac5x_db.dtb
+dtb-$(CONFIG_ARCH_MVEBU) += ac5_db.dtb
+dtb-$(CONFIG_ARCH_MVEBU) += ac5_as4564_trampoline.dtb
+dtb-$(CONFIG_ARCH_MVEBU) += ac5_db_trampoline.dtb
+dtb-$(CONFIG_ARCH_MVEBU) += ac5_rd.dtb
 dtb-$(CONFIG_ARCH_MVEBU) += armada-3720-db.dtb
 dtb-$(CONFIG_ARCH_MVEBU) += armada-3720-espressobin.dtb
 dtb-$(CONFIG_ARCH_MVEBU) += armada-3720-espressobin-emmc.dtb

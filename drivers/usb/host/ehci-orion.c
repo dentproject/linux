@@ -19,6 +19,8 @@
 #include <linux/usb/hcd.h>
 #include <linux/io.h>
 #include <linux/dma-mapping.h>
+#include <linux/of_reserved_mem.h>
+
 
 #include "ehci.h"
 
@@ -221,6 +223,14 @@ static int ehci_orion_drv_probe(struct platform_device *pdev)
 
 	pr_debug("Initializing Orion-SoC USB Host Controller\n");
 
+	if (of_device_is_compatible(pdev->dev.of_node, "marvell,ac5-ehci")) {
+		err = of_reserved_mem_device_init(&pdev->dev);
+		if (err) {
+			dev_err(&pdev->dev, "Could not get reserved memory\n");
+			return -ENOMEM;
+		}
+	}
+
 	irq = platform_get_irq(pdev, 0);
 	if (irq <= 0) {
 		err = -ENODEV;
@@ -232,7 +242,7 @@ static int ehci_orion_drv_probe(struct platform_device *pdev)
 	 * set. Since shared usb code relies on it, set it here for
 	 * now. Once we have dma capability bindings this can go away.
 	 */
-	err = dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	err = dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (err)
 		goto err;
 
@@ -341,7 +351,8 @@ static int ehci_orion_drv_remove(struct platform_device *pdev)
 static const struct of_device_id ehci_orion_dt_ids[] = {
 	{ .compatible = "marvell,orion-ehci", },
 	{ .compatible = "marvell,armada-3700-ehci", },
-	{},
+	{ .compatible = "marvell,ac5-ehci", },
+	{ },
 };
 MODULE_DEVICE_TABLE(of, ehci_orion_dt_ids);
 

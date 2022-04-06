@@ -554,6 +554,20 @@ const struct nand_interface_config *nand_get_reset_interface_config(void)
 }
 
 /**
+ * onfi_async_timing_mode_to_sdr_timings - [NAND Interface] Retrieve NAND
+ * timings according to the given ONFI timing mode
+ * @mode: ONFI timing mode
+ */
+const struct nand_sdr_timings *onfi_async_timing_mode_to_sdr_timings(int mode)
+{
+	if (mode < 0 || mode >= ARRAY_SIZE(onfi_sdr_timings))
+		return ERR_PTR(-EINVAL);
+
+	return &onfi_sdr_timings[mode].timings.sdr;
+}
+EXPORT_SYMBOL(onfi_async_timing_mode_to_sdr_timings);
+
+/**
  * onfi_find_closest_sdr_mode - Derive the closest ONFI SDR timing mode given a
  *                              set of timings
  * @spec_timings: the timings to challenge

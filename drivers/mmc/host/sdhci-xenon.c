@@ -18,6 +18,8 @@
 #include <linux/of.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
+#include <linux/of_reserved_mem.h>
+#include <linux/mm.h>
 
 #include "sdhci-pltfm.h"
 #include "sdhci-xenon.h"
@@ -422,6 +424,8 @@ static int xenon_probe_params(struct platform_device *pdev)
 	struct xenon_priv *priv = sdhci_pltfm_priv(pltfm_host);
 	u32 sdhc_id, nr_sdhc;
 	u32 tuning_count;
+	struct device_node *np = pdev->dev.of_node;
+	struct sysinfo si;
 
 	/* Disable HS200 on Armada AP806 */
 	if (priv->hw_version == XENON_AP806)
@@ -449,6 +453,15 @@ static int xenon_probe_params(struct platform_device *pdev)
 		}
 	}
 	priv->tuning_count = tuning_count;
+
+	si_meminfo(&si);
+
+	if (of_device_is_compatible(np, "marvell,ac5-sdhci") &&
+	    ((si.totalram * si.mem_unit) > 0x80000000 /*2G*/)) {
+		host->quirks |= SDHCI_QUIRK_BROKEN_DMA;
+		host->quirks |= SDHCI_QUIRK_BROKEN_ADMA;
+		dev_info(mmc_dev(mmc), "Disabling DMA because of 2GB DMA access limit.\n");
+	}
 
 	return xenon_phy_parse_params(dev, host);
 }
@@ -545,6 +558,15 @@ static int xenon_probe(struct platform_device *pdev)
 	err = xenon_probe_params(pdev);
 	if (err)
 		goto err_clk_axi;
+
+	/* Initialize reserved memory resources */
+	if (of_device_is_compatible(pdev->dev.of_node, "marvell, ac5-sdhci")) {
+		err = of_reserved_mem_device_init(&pdev->dev);
+		if (err) {
+			dev_err(&pdev->dev, "Could not get reserved memory\n");
+			return -ENOMEM;
+		}
+	}
 
 	err = xenon_sdhc_prepare(host);
 	if (err)
