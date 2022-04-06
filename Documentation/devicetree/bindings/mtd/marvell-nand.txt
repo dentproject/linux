@@ -2,6 +2,7 @@ Marvell NAND Flash Controller (NFC)
 
 Required properties:
 - compatible: can be one of the following:
+    * "marvell,ac5-nand-controller"
     * "marvell,armada-8k-nand-controller"
     * "marvell,armada370-nand-controller"
     * "marvell,pxa3xx-nand-controller"
@@ -57,10 +58,19 @@ Optional properties:
   step size will shrink or grow in order to fit the required strength.
   Step sizes are not completely random for all and follow certain
   patterns described in AN-379, "Marvell SoC NFC ECC".
+- nand-timing-mode:
+  This field is relevant only if "is_marvell_timing_modes" capabilitiy
+  is supportted, then the supported modes are: 0 to "max_mode_number"
+  (the maxmium mode the NFC can support, it is also one of the driver
+  capabilities). it is recomannded use it for Nand devices
+  that not supports ONFI and can't read the mode from parameter page,
+  else mode will be set to 0 or according to nand_ids table.
+  In case mode is read from parameter page but also the
+  "nand-timing-mode" is defined in dts, than device tree definition is
+  the one that counts.
 
 See Documentation/devicetree/bindings/mtd/nand-controller.yaml for more details on
 generic bindings.
-
 
 Example:
 nand_controller: nand-controller@d0000 {

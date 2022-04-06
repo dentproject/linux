@@ -14,6 +14,7 @@ Required Properties:
   - "marvell,armada-ap806-sdhci": For controllers on Armada AP806.
   - "marvell,armada-ap807-sdhci": For controllers on Armada AP807.
   - "marvell,armada-cp110-sdhci": For controllers on Armada CP110.
+  - "marvell,ac5-sdhci": For controllers on Marvell AC5X integrated switch SOC.
 
 - clocks:
   Array of clocks required for SDHC.

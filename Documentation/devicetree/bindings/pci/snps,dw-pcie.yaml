@@ -21,6 +21,7 @@ properties:
     anyOf:
       - {}
       - const: snps,dw-pcie
+      - const: marvell,ac5-pcie
 
   reg:
     description: |
