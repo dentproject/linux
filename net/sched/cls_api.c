@@ -35,6 +35,7 @@
 #include <net/tc_act/tc_gact.h>
 #include <net/tc_act/tc_police.h>
 #include <net/tc_act/tc_sample.h>
+#include <net/tc_act/tc_nat.h>
 #include <net/tc_act/tc_skbedit.h>
 #include <net/tc_act/tc_ct.h>
 #include <net/tc_act/tc_mpls.h>
@@ -563,8 +564,6 @@ static void __tcf_chain_put(struct tcf_chain *chain, bool by_act,
 	if (refcnt - chain->action_refcnt == 0 && !by_act) {
 		tc_chain_notify_delete(tmplt_ops, tmplt_priv, chain->index,
 				       block, NULL, 0, 0, false);
-		/* Last reference to chain, no need to lock. */
-		chain->flushing = false;
 	}
 
 	if (refcnt == 0)
@@ -615,6 +614,9 @@ static void tcf_chain_flush(struct tcf_chain *chain, bool rtnl_held)
 		tcf_proto_put(tp, rtnl_held, NULL);
 		tp = tp_next;
 	}
+
+	/* Last reference to chain, no need to lock. */
+	chain->flushing = false;
 }
 
 static int tcf_block_setup(struct tcf_block *block,
@@ -3665,6 +3667,12 @@ int tc_setup_flow_action(struct flow_action *flow_action,
 			entry->ct.action = tcf_ct_action(act);
 			entry->ct.zone = tcf_ct_zone(act);
 			entry->ct.flow_table = tcf_ct_ft(act);
+		} else if (is_tcf_nat(act)) {
+			entry->id = FLOW_ACTION_NAT;
+			entry->nat.old_addr = tcf_nat_old_addr(act);
+			entry->nat.new_addr = tcf_nat_new_addr(act);
+			entry->nat.flags = tcf_nat_flags(act);
+			entry->nat.mask = tcf_nat_mask(act);
 		} else if (is_tcf_mpls(act)) {
 			switch (tcf_mpls_action(act)) {
 			case TCA_MPLS_ACT_PUSH:

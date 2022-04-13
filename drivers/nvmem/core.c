@@ -567,35 +567,43 @@ int nvmem_unregister_notifier(struct notifier_block *nb)
 }
 EXPORT_SYMBOL_GPL(nvmem_unregister_notifier);
 
-static int nvmem_add_cells_from_table(struct nvmem_device *nvmem)
+static int __nvmem_add_cells_from_table(struct nvmem_device *nvmem,
+					struct nvmem_cell_table *table)
 {
 	const struct nvmem_cell_info *info;
-	struct nvmem_cell_table *table;
 	struct nvmem_cell *cell;
-	int rval = 0, i;
+	int err, i;
+
+	for (i = 0; i < table->ncells; i++) {
+		info = &table->cells[i];
+
+		cell = kzalloc(sizeof(*cell), GFP_KERNEL);
+		if (!cell)
+			return -ENOMEM;
+
+		err = nvmem_cell_info_to_nvmem_cell(nvmem, info, cell);
+		if (err) {
+			kfree(cell);
+			return err;
+		}
+
+		nvmem_cell_add(cell);
+	}
+
+	return 0;
+}
+
+static int nvmem_add_cells_from_table(struct nvmem_device *nvmem)
+{
+	struct nvmem_cell_table *table;
+	int rval = 0;
 
 	mutex_lock(&nvmem_cell_mutex);
 	list_for_each_entry(table, &nvmem_cell_tables, node) {
 		if (strcmp(nvmem_dev_name(nvmem), table->nvmem_name) == 0) {
-			for (i = 0; i < table->ncells; i++) {
-				info = &table->cells[i];
-
-				cell = kzalloc(sizeof(*cell), GFP_KERNEL);
-				if (!cell) {
-					rval = -ENOMEM;
-					goto out;
-				}
-
-				rval = nvmem_cell_info_to_nvmem_cell(nvmem,
-								     info,
-								     cell);
-				if (rval) {
-					kfree(cell);
-					goto out;
-				}
-
-				nvmem_cell_add(cell);
-			}
+			rval = __nvmem_add_cells_from_table(nvmem, table);
+			if (rval)
+				goto out;
 		}
 	}
 
@@ -1837,6 +1845,13 @@ EXPORT_SYMBOL_GPL(nvmem_device_write);
  */
 void nvmem_add_cell_table(struct nvmem_cell_table *table)
 {
+	const char *dev_name = table->nvmem_name;
+	struct nvmem_device *nvmem;
+
+	nvmem = __nvmem_device_get((void *)dev_name, device_match_name);
+	if (nvmem)
+		__nvmem_add_cells_from_table(nvmem, table);
+
 	mutex_lock(&nvmem_cell_mutex);
 	list_add_tail(&table->node, &nvmem_cell_tables);
 	mutex_unlock(&nvmem_cell_mutex);

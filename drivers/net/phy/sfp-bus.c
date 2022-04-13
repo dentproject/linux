@@ -38,6 +38,12 @@ struct sfp_bus {
 	bool started;
 };
 
+static void sfp_quirk_1000basex(const struct sfp_eeprom_id *id,
+                                unsigned long *modes)
+{
+        phylink_set(modes, 1000baseX_Full);
+}
+
 static void sfp_quirk_2500basex(const struct sfp_eeprom_id *id,
 				unsigned long *modes)
 {
@@ -54,6 +60,14 @@ static void sfp_quirk_ubnt_uf_instant(const struct sfp_eeprom_id *id,
 	phylink_zero(modes);
 	phylink_set(modes, 1000baseX_Full);
 }
+
+static void sfp_quirk_finisar_1g_10g(const struct sfp_eeprom_id *id,
+                                 unsigned long *modes)
+{
+       phylink_set(modes, 1000baseX_Full);
+       phylink_set(modes, 10000baseSR_Full);
+}
+
 
 static const struct sfp_quirk sfp_quirks[] = {
 	{
@@ -78,7 +92,23 @@ static const struct sfp_quirk sfp_quirks[] = {
 		.vendor = "UBNT",
 		.part = "UF-INSTANT",
 		.modes = sfp_quirk_ubnt_uf_instant,
-	},
+	}, {
+               // Finisar FTLF8536P4BCL can operate at 1000base-X and 10000base-SR,
+               // but reports 25G & 100GBd SR in it's EEPROM
+               .vendor = "FINISAR CORP.",
+               .part = "FTLF8536P4BCL",
+               .modes = sfp_quirk_finisar_1g_10g,
+       }, {
+		// Finisar FTLX1471D3BCL to support 1000base-X and 10000base-SR,
+		.vendor = "FINISAR CORP.",
+		.part = "FTLX1471D3BCL",
+		.modes = sfp_quirk_1000basex,
+	}, {
+		// Finisar FTLF8536P4BCL to support 1000base-X and 10000base-SR,
+		.vendor = "FINISAR CORP.",
+		.part = "FTLX8574D3BCL",
+		.modes = sfp_quirk_1000basex,
+ 	}
 };
 
 static size_t sfp_strlen(const char *str, size_t maxlen)

@@ -48,6 +48,10 @@ struct flow_match_ports {
 	struct flow_dissector_key_ports *key, *mask;
 };
 
+struct flow_match_ports_range {
+	struct flow_dissector_key_ports_range *key, *mask;
+};
+
 struct flow_match_icmp {
 	struct flow_dissector_key_icmp *key, *mask;
 };
@@ -94,6 +98,8 @@ void flow_rule_match_ip(const struct flow_rule *rule,
 			struct flow_match_ip *out);
 void flow_rule_match_ports(const struct flow_rule *rule,
 			   struct flow_match_ports *out);
+void flow_rule_match_ports_range(const struct flow_rule *rule,
+			   struct flow_match_ports_range *out);
 void flow_rule_match_tcp(const struct flow_rule *rule,
 			 struct flow_match_tcp *out);
 void flow_rule_match_icmp(const struct flow_rule *rule,
@@ -143,6 +149,7 @@ enum flow_action_id {
 	FLOW_ACTION_POLICE,
 	FLOW_ACTION_CT,
 	FLOW_ACTION_CT_METADATA,
+	FLOW_ACTION_NAT,
 	FLOW_ACTION_MPLS_PUSH,
 	FLOW_ACTION_MPLS_POP,
 	FLOW_ACTION_MPLS_MANGLE,
@@ -250,6 +257,12 @@ struct flow_action_entry {
 			u32 labels[4];
 			bool orig_dir;
 		} ct_metadata;
+		struct {				/* FLOW_ACTION_NAT */
+			__be32		old_addr;
+			__be32		new_addr;
+			__be32		mask;
+			u32		flags;
+		} nat;
 		struct {				/* FLOW_ACTION_MPLS_PUSH */
 			u32		label;
 			__be16		proto;

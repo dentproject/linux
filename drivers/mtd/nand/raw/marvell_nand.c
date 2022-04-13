@@ -90,6 +90,8 @@
 #include <linux/dma/pxa-dma.h>
 #include <linux/platform_data/mtd-nand-pxa3xx.h>
 
+#include "internals.h"
+
 /* Data FIFO granularity, FIFO reads/writes must be a multiple of this length */
 #define FIFO_DEPTH		8
 #define FIFO_REP(x)		(x / sizeof(u32))
@@ -226,6 +228,26 @@
 #define XTYPE_COMMAND_DISPATCH	6
 #define XTYPE_MASK		7
 
+/* use tRP_min, tWC_min and tWP_min to distinct across timings modes */
+static int is_timings_equal(const struct nand_sdr_timings *t1,
+			    const struct nand_sdr_timings *t2)
+{
+	if (t1->tRP_min == t2->tRP_min &&
+	    t1->tWC_min == t2->tWC_min &&
+	    t1->tWP_min == t2->tWP_min)
+		return true;
+
+	return false;
+}
+
+/*  ndtr0,1 set , each set has few modes level */
+enum marvell_nfc_timing_mode_set {
+	MARVELL_NFC_NDTR_SET_0,		/*tested with ac5*/
+
+	MARVELL_NFC_NDTR_NUM_OF_SET,
+	MARVELL_NFC_NDTR_SET_NON = MARVELL_NFC_NDTR_NUM_OF_SET
+};
+
 /**
  * struct marvell_hw_ecc_layout - layout of Marvell ECC
  *
@@ -283,14 +305,21 @@ struct marvell_hw_ecc_layout {
 
 /* Layouts explained in AN-379_Marvell_SoC_NFC_ECC */
 static const struct marvell_hw_ecc_layout marvell_nfc_layouts[] = {
-	MARVELL_LAYOUT(  512,   512,  1,  1,  1,  512,  8,  8,  0,  0,  0),
-	MARVELL_LAYOUT( 2048,   512,  1,  1,  1, 2048, 40, 24,  0,  0,  0),
-	MARVELL_LAYOUT( 2048,   512,  4,  1,  1, 2048, 32, 30,  0,  0,  0),
-	MARVELL_LAYOUT( 2048,   512,  8,  2,  1, 1024,  0, 30,1024,32, 30),
-	MARVELL_LAYOUT( 4096,   512,  4,  2,  2, 2048, 32, 30,  0,  0,  0),
-	MARVELL_LAYOUT( 4096,   512,  8,  5,  4, 1024,  0, 30,  0, 64, 30),
-	MARVELL_LAYOUT( 8192,   512,  4,  4,  4, 2048,  0, 30,  0,  0,  0),
-	MARVELL_LAYOUT( 8192,   512,  8,  9,  8, 1024,  0, 30,  0, 160, 30),
+	MARVELL_LAYOUT(512,   512,  1,  1,  1,  512,  8,  8,  0,   0,  0),
+	MARVELL_LAYOUT(2048,   512,  1,  1,  1, 2048, 40, 24,  0,   0,  0),
+	MARVELL_LAYOUT(2048,   512,  4,  1,  1, 2048, 32, 30,  0,   0,  0),
+	MARVELL_LAYOUT(2048,   512,  8,  2,  1, 1024,  0, 30,  1024, 32, 30),
+	MARVELL_LAYOUT(2048,   512,  8,  2,  1, 1024,  0, 30,  1024, 64, 30),
+	MARVELL_LAYOUT(2048,   512,  12, 3,  2, 704,   0, 30,  640, 0,  30),
+	MARVELL_LAYOUT(2048,   512,  16, 5,  4, 512,   0, 30,  0,   32, 30),
+	MARVELL_LAYOUT(4096,   512,  4,  2,  2, 2048, 32, 30,  0,   0,  0),
+	MARVELL_LAYOUT(4096,   512,  8,  5,  4, 1024,  0, 30,  0,   64, 30),
+	MARVELL_LAYOUT(4096,   512,  12, 6,  5, 704,   0, 30,  576, 32, 30),
+	MARVELL_LAYOUT(4096,   512,  16, 9,  8, 512,   0, 30,  0,   32, 30),
+	MARVELL_LAYOUT(8192,   512,  4,  4,  4, 2048,  0, 30,  0,   0,  0),
+	MARVELL_LAYOUT(8192,   512,  8,  9,  8, 1024,  0, 30,  0,  160, 30),
+	MARVELL_LAYOUT(8192,   512,  12, 12, 11, 704,  0, 30,  448, 64, 30),
+	MARVELL_LAYOUT(8192,   512,  16, 17, 16, 512,  0, 30,  0,   32, 30),
 };
 
 /**
@@ -328,6 +357,7 @@ struct marvell_nand_chip_sel {
  * @selected_die:	Current active CS
  * @nsels:		Number of CS lines required by the NAND chip
  * @sels:		Array of CS lines descriptions
+ * @nand_timing_mode:	nand-timing-mode from dts
  */
 struct marvell_nand_chip {
 	struct nand_chip chip;
@@ -339,7 +369,8 @@ struct marvell_nand_chip {
 	int addr_cyc;
 	int selected_die;
 	unsigned int nsels;
-	struct marvell_nand_chip_sel sels[];
+	struct marvell_nand_chip_sel sels[0];
+	int nand_timing_mode;
 };
 
 static inline struct marvell_nand_chip *to_marvell_nand(struct nand_chip *chip)
@@ -367,6 +398,10 @@ static inline struct marvell_nand_chip_sel *to_nand_sel(struct marvell_nand_chip
  *			BCH error detection and correction algorithm,
  *			NDCB3 register has been added
  * @use_dma:		Use dma for data transfers
+ * @is_marvell_timing_modes: use marvell predefined register values per mode
+ * @max_mode_number: supported mode by NFC (max mode that supported)
+ * @timing_mode_set: which set to use from predefined array of sets
+ *			each set has few modes
  */
 struct marvell_nfc_caps {
 	unsigned int max_cs_nb;
@@ -375,6 +410,9 @@ struct marvell_nfc_caps {
 	bool legacy_of_bindings;
 	bool is_nfcv2;
 	bool use_dma;
+	bool is_marvell_timing_modes;
+	unsigned int max_mode_number;
+	enum marvell_nfc_timing_mode_set timing_mode_set;
 };
 
 /**
@@ -484,6 +522,113 @@ struct marvell_nfc_op {
 	unsigned int data_instr_idx;
 	const struct nand_op_instr *data_instr;
 };
+
+/* NFC ndtr0 */
+union marvell_nand_ndtr0 {
+	struct {
+		unsigned  int t_RP                 :3;  /* 0-2   */
+		unsigned  int t_RH                 :3;  /* 3-5   */
+		unsigned  int t_RPE                :1;  /* 6     */
+		unsigned  int t_RE_edge            :1;  /* 7     */
+		unsigned  int t_WP                 :3;  /* 8-10  */
+		unsigned  int t_WH                 :3;  /* 11-13 */
+		unsigned  int reserved            :2;  /* 14-15 */
+		unsigned  int t_CS                 :3;  /* 16-18 */
+		unsigned  int t_CH                 :3;  /* 19-21 */
+		unsigned  int rd_cnt_del          :4;  /* 22-25 */
+		unsigned  int sel_cnrl             :1;  /* 26    */
+		unsigned  int t_ADL                :5;  /* 27-31 */
+	} fields;
+	unsigned  int  regValue;
+};
+
+/* NFC ndtr1 */
+union marvell_nand_ndtr1 {
+	struct {
+		unsigned  int t_AR                 :4;  /* 0-3   */
+		unsigned  int t_WHR                :4;  /* 4-7   */
+		unsigned  int t_RHW                :2;  /* 8-9   */
+		unsigned  int reserved            :4;  /* 10-13 */
+		unsigned  int pre_scale            :1;  /* 14    */
+		unsigned  int wait_mode           :1;  /* 15    */
+		unsigned  int t_R                  :16; /* 16-31 */
+	} fields;
+	unsigned  int  regValue;
+};
+
+#define NUM_OF_TIMING_MODES	6
+
+#define MARVELL_NTDR0(trp, trh, trpe, tre_edge, twp, twh, resrv, tcs, tch, \
+		      rd_cnt_del1, selcnrl, tadl)	\
+		{\
+			.fields = {\
+				.t_RP = trp,                 /* 0-2   */\
+				.t_RH = trh,                 /* 3-5   */\
+				.t_RPE = trpe,               /* 6     */\
+				.t_RE_edge = tre_edge,       /* 7     */\
+				.t_WP = twp,                 /* 8-10  */\
+				.t_WH = twh,                 /* 11-13 */\
+				.reserved = resrv,          /* 14-15 */\
+				.t_CS = tcs,                 /* 16-18 */\
+				.t_CH = tch,                 /* 19-21 */\
+				.rd_cnt_del = rd_cnt_del1,   /* 22-25 */\
+				.sel_cnrl = selcnrl,         /* 26    */\
+				.t_ADL = tadl,               /* 27-31 */\
+			} \
+		}
+
+#define MARVELL_NTDR1(tar, twhr, trhw, resrv, prescale, waiting_mode, tr)	\
+		{ \
+			.fields = { \
+				.t_AR = tar,                 /* 0-3   */\
+				.t_WHR = twhr,               /* 4-7   */\
+				.t_RHW = trhw,               /* 8-9   */\
+				.reserved = resrv,          /* 10-13 */\
+				.pre_scale = prescale,       /* 14    */\
+				.wait_mode = waiting_mode,  /* 15    */\
+				.t_R = tr,                   /* 16-31 */\
+			} \
+		}
+
+/* ndtr0_modes and ndtr1_modes are arrays of modes with optimal values
+ * that were tested with Marvell NFC with correlation to ONFI timings mode
+ * each entry in the array presents different set of modes , for example ac5
+ * is entry 0
+ */
+/* todo: add more modes ASAP */
+
+/* Layouts explained in AN-379_Marvell_SoC_NFC_ECC */
+union marvell_nand_ndtr0 ndtr0_modes[MARVELL_NFC_NDTR_NUM_OF_SET][NUM_OF_TIMING_MODES] = {
+	/* value tested with AC5 */
+	{
+		MARVELL_NTDR0(7, 7, 1, 0, 7, 7, 0, 7, 7, 0, 1, 31),
+		MARVELL_NTDR0(6, 3, 0, 0, 4, 4, 0, 7, 7, 1, 1, 15),
+		MARVELL_NTDR0(4, 3, 0, 0, 3, 3, 0, 7, 7, 2, 1, 15),
+		MARVELL_NTDR0(2, 2, 0, 0, 2, 1, 0, 1, 0, 2, 1, 15)
+	}
+};
+
+union marvell_nand_ndtr1 ndtr1_modes[MARVELL_NFC_NDTR_NUM_OF_SET][NUM_OF_TIMING_MODES] = {
+	/* value tested with AC5 */
+	{
+		MARVELL_NTDR1(15, 15, 3, 0, 0, 1, 50),
+		MARVELL_NTDR1(15, 15, 3, 0, 0, 1, 25),
+		MARVELL_NTDR1(15, 15, 3, 0, 0, 1, 25),
+		MARVELL_NTDR1(11, 11, 2, 0, 0, 1, 25)
+	}
+};
+
+/*
+ * get nand timing-mode from device tree
+ */
+static int get_nand_timing_mode(struct device_node *np)
+{
+	int ret;
+	u32 val;
+
+	ret = of_property_read_u32(np, "nand-timing-mode", &val);
+	return ret ? ret : val;
+}
 
 /*
  * Internal helper to conditionnally apply a delay (from the above structure,
@@ -2245,14 +2390,22 @@ static int marvell_nand_hw_ecc_controller_init(struct mtd_info *mtd,
 		if (mtd->oobsize < 128) {
 			dev_err(nfc->dev, "Requested layout needs at least 128 OOB bytes\n");
 			return -ENOTSUPP;
-		} else {
-			chip->bbt_options |= NAND_BBT_NO_OOB_BBM;
 		}
+		chip->bbt_options |= NAND_BBT_NO_OOB_BBM;
 	}
 
 	mtd_set_ooblayout(mtd, &marvell_nand_ooblayout_ops);
 	ecc->steps = l->nchunks;
 	ecc->size = l->data_bytes;
+
+	/* nand_scan_tail func perform  validity tests for ECC strength, and it
+	 * assumes that all chunks are with same size. in our case when ecc is 12
+	 * the chunk size is 704 but the last chunk is with different size so
+	 * we cheat it nand_scan_tail validity tests by set info->ecc_size value to
+	 * 512
+	 */
+	if (ecc->strength == 12)
+		ecc->size = 512;
 
 	if (ecc->strength == 1) {
 		chip->ecc.algo = NAND_ECC_ALGO_HAMMING;
@@ -2354,9 +2507,11 @@ static int marvell_nfc_setup_interface(struct nand_chip *chip, int chipnr,
 	struct marvell_nand_chip *marvell_nand = to_marvell_nand(chip);
 	struct marvell_nfc *nfc = to_marvell_nfc(chip->controller);
 	unsigned int period_ns = 1000000000 / clk_get_rate(nfc->core_clk) * 2;
-	const struct nand_sdr_timings *sdr;
+	const struct nand_sdr_timings *sdr, *timings;
 	struct marvell_nfc_timings nfc_tmg;
 	int read_delay;
+	enum marvell_nfc_timing_mode_set modes_set;
+	int mode = 0;
 
 	sdr = nand_get_sdr_timings(conf);
 	if (IS_ERR(sdr))
@@ -2415,32 +2570,70 @@ static int marvell_nfc_setup_interface(struct nand_chip *chip, int chipnr,
 			nfc_tmg.tR = 0;
 	}
 
-	if (chipnr < 0)
-		return 0;
+	/* get the timing modes from predefined values according to its compatibility*/
+	if (nfc->caps->is_marvell_timing_modes) {
+		/* get the mode set */
+		modes_set = nfc->caps->timing_mode_set;
+		if (modes_set >= MARVELL_NFC_NDTR_SET_NON) {
+			dev_warn(nfc->dev,
+				 "Warning: not supported timing registers set,use set number 0 by default\n");
 
-	marvell_nand->ndtr0 =
-		NDTR0_TRP(nfc_tmg.tRP) |
-		NDTR0_TRH(nfc_tmg.tRH) |
-		NDTR0_ETRP(nfc_tmg.tRP) |
-		NDTR0_TWP(nfc_tmg.tWP) |
-		NDTR0_TWH(nfc_tmg.tWH) |
-		NDTR0_TCS(nfc_tmg.tCS) |
-		NDTR0_TCH(nfc_tmg.tCH);
+			modes_set = MARVELL_NFC_NDTR_SET_0;
+		}
 
-	marvell_nand->ndtr1 =
-		NDTR1_TAR(nfc_tmg.tAR) |
-		NDTR1_TWHR(nfc_tmg.tWHR) |
-		NDTR1_TR(nfc_tmg.tR);
+		/* find the caller mode according to timings values */
+		/* if exit on error it means no more modes; not suppose to happen*/
+		do {
+			timings = onfi_async_timing_mode_to_sdr_timings(mode);
+			if (is_timings_equal(timings, sdr))
+				break;
+			mode++;
+		} while (!IS_ERR(timings));
 
-	if (nfc->caps->is_nfcv2) {
-		marvell_nand->ndtr0 |=
-			NDTR0_RD_CNT_DEL(read_delay) |
-			NDTR0_SELCNTR |
-			NDTR0_TADL(nfc_tmg.tADL);
+		/* if mode is not supported by NFC, return false or if nand-timing-mode that
+		 * exists in device tree greater then caller mode also return false and wait
+		 * for caller to try with next mode (mode-1). we want the nand feature to be
+		 * configured with nand-timing-mode value
+		 */
+		if (mode > nfc->caps->max_mode_number ||
+		    (marvell_nand->nand_timing_mode >= 0 &&
+			 mode > marvell_nand->nand_timing_mode))
+			return -EOPNOTSUPP;
 
-		marvell_nand->ndtr1 |=
-			NDTR1_TRHW(nfc_tmg.tRHW) |
-			NDTR1_WAIT_MODE;
+		/* just checking NFC capabilities no need to set the registers */
+		if (chipnr < 0)
+			return 0;
+
+		marvell_nand->ndtr0 = ndtr0_modes[modes_set][mode].regValue;
+		marvell_nand->ndtr1 = ndtr1_modes[modes_set][mode].regValue;
+	} else {
+		if (chipnr < 0)
+			return 0;
+
+		marvell_nand->ndtr0 =
+			NDTR0_TRP(nfc_tmg.tRP) |
+			NDTR0_TRH(nfc_tmg.tRH) |
+			NDTR0_ETRP(nfc_tmg.tRP) |
+			NDTR0_TWP(nfc_tmg.tWP) |
+			NDTR0_TWH(nfc_tmg.tWH) |
+			NDTR0_TCS(nfc_tmg.tCS) |
+			NDTR0_TCH(nfc_tmg.tCH);
+
+		marvell_nand->ndtr1 =
+			NDTR1_TAR(nfc_tmg.tAR) |
+			NDTR1_TWHR(nfc_tmg.tWHR) |
+			NDTR1_TR(nfc_tmg.tR);
+
+		if (nfc->caps->is_nfcv2) {
+			marvell_nand->ndtr0 |=
+				NDTR0_RD_CNT_DEL(read_delay) |
+				NDTR0_SELCNTR |
+				NDTR0_TADL(nfc_tmg.tADL);
+
+			marvell_nand->ndtr1 |=
+				NDTR1_TRHW(nfc_tmg.tRHW) |
+				NDTR1_WAIT_MODE;
+		}
 	}
 
 	return 0;
@@ -2562,6 +2755,7 @@ static int marvell_nand_chip_init(struct device *dev, struct marvell_nfc *nfc,
 	struct nand_chip *chip;
 	int nsels, ret, i;
 	u32 cs, rb;
+	struct device_node *dn;
 
 	/*
 	 * The legacy "num-cs" property indicates the number of CS on the only
@@ -2674,6 +2868,10 @@ static int marvell_nand_chip_init(struct device *dev, struct marvell_nfc *nfc,
 
 	if (!of_property_read_bool(np, "marvell,nand-keep-config"))
 		chip->options |= NAND_KEEP_TIMINGS;
+
+	/* read the mode from device tree */
+	dn = nand_get_flash_node(chip);
+	marvell_nand->nand_timing_mode = get_nand_timing_mode(dn);
 
 	mtd = nand_to_mtd(chip);
 	mtd->dev.parent = dev;
@@ -3058,6 +3256,15 @@ static const struct marvell_nfc_caps marvell_armada_8k_nfc_caps = {
 	.is_nfcv2 = true,
 };
 
+static const struct marvell_nfc_caps marvell_ac5_caps = {
+	.max_cs_nb = 2,
+	.max_rb_nb = 1,
+	.is_nfcv2 = true,
+	.is_marvell_timing_modes = true,
+	.max_mode_number = 3,
+	.timing_mode_set = MARVELL_NFC_NDTR_SET_0,
+};
+
 static const struct marvell_nfc_caps marvell_armada370_nfc_caps = {
 	.max_cs_nb = 4,
 	.max_rb_nb = 2,
@@ -3105,6 +3312,10 @@ static const struct of_device_id marvell_nfc_of_ids[] = {
 	{
 		.compatible = "marvell,armada-8k-nand-controller",
 		.data = &marvell_armada_8k_nfc_caps,
+	},
+	{
+		.compatible = "marvell,ac5-nand-controller",
+		.data = &marvell_ac5_caps,
 	},
 	{
 		.compatible = "marvell,armada370-nand-controller",

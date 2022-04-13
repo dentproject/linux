@@ -254,6 +254,16 @@ drop:
 	return TC_ACT_SHOT;
 }
 
+static void tcf_nat_stats_update(struct tc_action *a, u64 bytes, u64 packets,
+				 u64 drops, u64 lastuse, bool hw)
+{
+	struct tcf_nat *nat = to_tcf_nat(a);
+	struct tcf_t *tm = &nat->tcf_tm;
+
+	tcf_action_update_stats(a, bytes, packets, drops, hw);
+	tm->lastuse = max_t(u64, tm->lastuse, lastuse);
+}
+
 static int tcf_nat_dump(struct sk_buff *skb, struct tc_action *a,
 			int bind, int ref)
 {
@@ -311,6 +321,7 @@ static struct tc_action_ops act_nat_ops = {
 	.id		=	TCA_ID_NAT,
 	.owner		=	THIS_MODULE,
 	.act		=	tcf_nat_act,
+	.stats_update	=	tcf_nat_stats_update,
 	.dump		=	tcf_nat_dump,
 	.init		=	tcf_nat_init,
 	.walk		=	tcf_nat_walker,
