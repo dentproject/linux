@@ -314,9 +314,15 @@ int prestera_hw_fdb_flush_vlan(const struct prestera_switch *sw, u16 vid,
 int prestera_hw_fdb_flush_port_vlan(const struct prestera_port *port, u16 vid,
 				    u32 mode);
 int prestera_hw_macvlan_add(const struct prestera_switch *sw, u16 vr_id,
-			    const u8 *mac, u16 vid);
+			    const u8 *mac, u16 vid,
+			    struct prestera_iface *iface);
 int prestera_hw_macvlan_del(const struct prestera_switch *sw, u16 vr_id,
-			    const u8 *mac, u16 vid);
+			    const u8 *mac, u16 vid,
+			    struct prestera_iface *iface);
+int prestera_hw_fdb_routed_add(const struct prestera_switch *sw,
+			       const u8 *mac, u16 vid);
+int prestera_hw_fdb_routed_del(const struct prestera_switch *sw,
+			       const u8 *mac, u16 vid);
 
 /* Bridge API */
 int prestera_hw_bridge_create(const struct prestera_switch *sw, u16 *bridge_id);
@@ -468,6 +474,10 @@ int prestera_hw_flood_domain_ports_reset(struct prestera_flood_domain *domain);
 
 int prestera_hw_mdb_create(struct prestera_mdb_entry *mdb);
 int prestera_hw_mdb_destroy(struct prestera_mdb_entry *mdb);
+
+/* HW IPG API */
+int prestera_hw_ipg_set(struct prestera_switch *sw, u32 ipg);
+int prestera_hw_ipg_get(struct prestera_switch *sw, u32 *ipg);
 
 /* QoS */
 int prestera_hw_port_qos_mapping_update(const struct prestera_port *port,

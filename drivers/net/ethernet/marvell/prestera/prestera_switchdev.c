@@ -11,6 +11,7 @@
 #include <net/switchdev.h>
 #include <net/netevent.h>
 #include <net/vxlan.h>
+#include <linux/rhashtable.h>
 
 #include "prestera.h"
 #include "prestera_switchdev.h"
@@ -20,11 +21,13 @@
 #define PRESTERA_DEFAULT_ISOLATION_SRCID 1 /* source_id */
 
 struct prestera_switchdev {
+	struct prestera_switch *sw;
 	struct notifier_block swdev_n;
 	struct notifier_block swdev_blocking_n;
 
 	u32 ageing_time;
 	struct list_head bridge_list;
+	struct rhashtable routed_fdb_ht;
 	bool bridge_8021q_exists;
 };
 
@@ -42,6 +45,14 @@ struct prestera_br_mdb_entry {
 	bool enabled;
 };
 
+struct prestera_routed_fdb_entry {
+	struct prestera_routed_fdb_entry_key {
+		u8 addr[ETH_ALEN];
+		u16 vid;
+	} key;
+	struct rhash_head ht_node;
+};
+
 struct prestera_bridge {
 	struct net_device *dev;
 	struct list_head bridge_node;
@@ -52,6 +63,10 @@ struct prestera_bridge {
 	/* This can be extended to list of isolation groups */
 	u32 isolation_srcid; /* source_id */
 	u8 vlan_enabled:1, multicast_enabled:1, mrouter:1;
+	/* TODO: Dont use refcnt type, as it can reach zero
+	 * (Still hold by br_ports). Need to refactor.
+	 */
+	unsigned int ref_count;
 };
 
 struct prestera_bridge_port {
@@ -74,9 +89,17 @@ struct prestera_bridge_vlan {
 
 struct prestera_swdev_work {
 	struct work_struct work;
+	struct prestera_switch *sw;
 	struct switchdev_notifier_fdb_info fdb_info;
 	struct net_device *dev;
 	unsigned long event;
+};
+
+static const struct rhashtable_params __prestera_routed_fdb_ht_params = {
+	.key_offset  = offsetof(struct prestera_routed_fdb_entry, key),
+	.head_offset = offsetof(struct prestera_routed_fdb_entry, ht_node),
+	.key_len     = sizeof(struct prestera_routed_fdb_entry_key),
+	.automatic_shrinking = true,
 };
 
 static struct workqueue_struct *swdev_owq;
@@ -110,6 +133,62 @@ static int prestera_br_mdb_port_add(struct prestera_br_mdb_entry *br_mdb,
 static void
 prestera_mdb_port_del(struct prestera_mdb_entry *mdb,
 		      struct net_device *orig_dev);
+
+static struct prestera_bridge *
+prestera_bridge_get(struct prestera_switch *sw, struct net_device *br_dev);
+static void
+prestera_bridge_put(struct prestera_switch *sw, struct prestera_bridge *bridge);
+
+static struct prestera_routed_fdb_entry *
+prestera_routed_fdb_entry_find(const struct prestera_switch *sw,
+			       const struct prestera_routed_fdb_entry_key *k)
+{
+	return rhashtable_lookup_fast(&sw->swdev->routed_fdb_ht, k,
+				      __prestera_routed_fdb_ht_params);
+}
+
+static void
+prestera_routed_fdb_entry_destroy(struct prestera_switch *sw,
+				  struct prestera_routed_fdb_entry *e)
+{
+	rhashtable_remove_fast(&sw->swdev->routed_fdb_ht, &e->ht_node,
+			       __prestera_routed_fdb_ht_params);
+	prestera_hw_fdb_routed_del(sw, e->key.addr, e->key.vid);
+	kfree(e);
+}
+
+static struct prestera_routed_fdb_entry *
+prestera_routed_fdb_entry_create(struct prestera_switch *sw,
+				 struct prestera_routed_fdb_entry_key *k)
+{
+	struct prestera_routed_fdb_entry *e;
+	int err;
+
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		goto err_kzalloc;
+
+	memcpy(&e->key, k, sizeof(*k));
+
+	/* HW */
+	err = prestera_hw_fdb_routed_add(sw, e->key.addr, e->key.vid);
+	if (err)
+		goto err_hw_add;
+
+	err = rhashtable_insert_fast(&sw->swdev->routed_fdb_ht, &e->ht_node,
+				     __prestera_routed_fdb_ht_params);
+	if (err)
+		goto err_rhashtable_insert;
+
+	return e;
+
+err_rhashtable_insert:
+	prestera_hw_fdb_routed_del(sw, e->key.addr, e->key.vid);
+err_hw_add:
+	kfree(e);
+err_kzalloc:
+	return NULL;
+}
 
 static struct prestera_bridge *
 prestera_bridge_find(const struct prestera_switch *sw,
@@ -381,6 +460,7 @@ prestera_port_vlan_bridge_leave(struct prestera_port_vlan *port_vlan)
 	port_count = prestera_bridge_vlan_port_count_get(br_port->bridge, vid);
 	br_vlan = prestera_bridge_vlan_find(br_port, vid);
 	last_port = port_count == 1;
+
 	if (last_vlan)
 		prestera_fdb_flush_port(port, mode);
 	else if (last_port)
@@ -1080,6 +1160,67 @@ prestera_port_fdb_set(struct prestera_port *port,
 	return err;
 }
 
+static int
+prestera_port_fdb_local_set(struct prestera_switch *sw,
+			    struct switchdev_notifier_fdb_info *fdb_info,
+			    bool adding)
+{
+	struct prestera_routed_fdb_entry_key rek;
+	struct prestera_bridge *bridge = NULL;
+	struct prestera_routed_fdb_entry *re;
+	u16 vid = 0;
+	int err = 0;
+
+	if (br_vlan_enabled(fdb_info->info.dev)) {
+		/* vid will be 0, in case .1Q bridge and entry without vid */
+		vid = fdb_info->vid;
+	} else {
+		if (fdb_info->vid)
+			goto out; /* ignore entries with vlan id .1D bridge */
+
+		bridge = prestera_bridge_get(sw, fdb_info->info.dev);
+		if (!bridge)
+			goto out;
+
+		vid = bridge->bridge_id;
+	}
+
+	if (!vid)
+		goto out;
+
+	memset(&rek, 0, sizeof(rek));
+	rek.vid = vid;
+	ether_addr_copy((u8 *)&rek.addr, fdb_info->addr);
+	re = prestera_routed_fdb_entry_find(sw, &rek);
+
+	if (adding && !re) {
+		re = prestera_routed_fdb_entry_create(sw, &rek);
+		if (!re) {
+			err = -EINVAL;
+			goto out;
+		}
+
+		/* keep bridge_id of .1D until all local fdb entries deleted */
+		if (bridge)
+			bridge->ref_count++;
+
+	} else if (!adding && re) {
+		prestera_routed_fdb_entry_destroy(sw, re);
+		if (bridge)
+			bridge->ref_count--;
+	}
+
+out:
+	/* Use get/put here, but not in _routed_fdb_entry_create/destroy,
+	 * because need object, that represent HW's vid (remove 1Q case here,
+	 * use generic vid for 1D and 1Q).
+	 */
+	if (bridge)
+		prestera_bridge_put(sw, bridge);
+
+	return err;
+}
+
 static void prestera_bridge_fdb_event_work(struct work_struct *work)
 {
 	int err = 0;
@@ -1093,13 +1234,24 @@ static void prestera_bridge_fdb_event_work(struct work_struct *work)
 	if (netif_is_vxlan(dev))
 		goto out;
 
-	port = prestera_port_dev_lower_find(dev);
-	if (!port)
-		goto out;
+	/* TODO: make function more pretty:
+	 * - check, if dev_lover realy needed by every case
+	 * - use sw in swdev_work for each case
+	 */
 
 	switch (swdev_work->event) {
 	case SWITCHDEV_FDB_ADD_TO_DEVICE:
 		fdb_info = &swdev_work->fdb_info;
+		if (fdb_info->is_local) {
+			prestera_port_fdb_local_set(swdev_work->sw,
+						    fdb_info, true);
+			break;
+		}
+
+		port = prestera_port_dev_lower_find(dev);
+		if (!port)
+			goto out;
+
 		if (!fdb_info->added_by_user)
 			break;
 		err = prestera_port_fdb_set(port, fdb_info, true);
@@ -1109,10 +1261,24 @@ static void prestera_bridge_fdb_event_work(struct work_struct *work)
 		break;
 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
 		fdb_info = &swdev_work->fdb_info;
+		if (fdb_info->is_local) {
+			prestera_port_fdb_local_set(swdev_work->sw,
+						    fdb_info, false);
+			break;
+		}
+
+		port = prestera_port_dev_lower_find(dev);
+		if (!port)
+			goto out;
+
 		prestera_port_fdb_set(port, fdb_info, false);
 		break;
 	case SWITCHDEV_FDB_ADD_TO_BRIDGE:
 	case SWITCHDEV_FDB_DEL_TO_BRIDGE:
+		port = prestera_port_dev_lower_find(dev);
+		if (!port)
+			goto out;
+
 		prestera_k_arb_fdb_evt(port->sw, port->net_dev);
 		break;
 	}
@@ -1124,7 +1290,7 @@ out:
 	dev_put(dev);
 }
 
-static int prestera_switchdev_event(struct notifier_block *unused,
+static int prestera_switchdev_event(struct notifier_block *nb,
 				    unsigned long event, void *ptr)
 {
 	int err = 0;
@@ -1132,7 +1298,9 @@ static int prestera_switchdev_event(struct notifier_block *unused,
 	struct prestera_swdev_work *swdev_work;
 	struct switchdev_notifier_fdb_info *fdb_info;
 	struct switchdev_notifier_info *info = ptr;
-	struct net_device *upper_br;
+	struct prestera_switchdev *swdev;
+
+	swdev = container_of(nb, struct prestera_switchdev, swdev_n);
 
 	if (event == SWITCHDEV_PORT_ATTR_SET) {
 		err = switchdev_handle_port_attr_set(net_dev, ptr,
@@ -1141,17 +1309,11 @@ static int prestera_switchdev_event(struct notifier_block *unused,
 		return notifier_from_errno(err);
 	}
 
-	upper_br = netdev_master_upper_dev_get_rcu(net_dev);
-	if (!upper_br)
-		return NOTIFY_DONE;
-
-	if (!netif_is_bridge_master(upper_br))
-		return NOTIFY_DONE;
-
 	swdev_work = kzalloc(sizeof(*swdev_work), GFP_ATOMIC);
 	if (!swdev_work)
 		return NOTIFY_BAD;
 
+	swdev_work->sw = swdev->sw;
 	swdev_work->dev = net_dev;
 	swdev_work->event = event;
 
@@ -1163,7 +1325,6 @@ static int prestera_switchdev_event(struct notifier_block *unused,
 		fdb_info = container_of(info,
 					struct switchdev_notifier_fdb_info,
 					info);
-
 		INIT_WORK(&swdev_work->work, prestera_bridge_fdb_event_work);
 		memcpy(&swdev_work->fdb_info, ptr,
 		       sizeof(swdev_work->fdb_info));
@@ -1298,7 +1459,7 @@ prestera_bridge_get(struct prestera_switch *sw, struct net_device *br_dev)
 static void
 prestera_bridge_put(struct prestera_switch *sw, struct prestera_bridge *bridge)
 {
-	if (list_empty(&bridge->port_list))
+	if (list_empty(&bridge->port_list) && !bridge->ref_count)
 		prestera_bridge_destroy(sw, bridge);
 }
 
@@ -1440,6 +1601,7 @@ int prestera_port_bridge_join(struct prestera_port *port,
 	struct prestera_bridge *bridge;
 	struct prestera_switch *sw = port->sw;
 	struct prestera_bridge_port *br_port;
+	struct net_device *port_upper;
 	int err;
 
 	br_port = prestera_bridge_port_get(sw, brport_dev);
@@ -1448,7 +1610,14 @@ int prestera_port_bridge_join(struct prestera_port *port,
 
 	bridge = br_port->bridge;
 
-	/* Enslaved port is not usable as a router interface */
+	/* Neither enslaved port nor its upper LAG is usable as a router interface */
+	port_upper = netdev_master_upper_dev_get(port->net_dev);
+	if (port_upper &&
+	    netif_is_lag_master(port_upper) &&
+	    prestera_rif_exists(sw, port_upper)) {
+		prestera_rif_enable(sw, port_upper, false);
+	}
+
 	if (prestera_rif_exists(sw, port->net_dev))
 		prestera_rif_enable(sw, port->net_dev, false);
 
@@ -1466,6 +1635,15 @@ int prestera_port_bridge_join(struct prestera_port *port,
 	return 0;
 
 err_port_join:
+	/* Offload RIF that was previosly disabled */
+	if (prestera_rif_exists(sw, port->net_dev))
+		prestera_rif_enable(sw, port->net_dev, true);
+
+	if (port_upper &&
+	    netif_is_lag_master(port_upper) &&
+	    prestera_rif_exists(sw, port_upper))
+		prestera_rif_enable(sw, port_upper, true);
+
 	prestera_bridge_port_put(sw, br_port);
 	return err;
 }
@@ -1495,6 +1673,7 @@ void prestera_port_bridge_leave(struct prestera_port *port,
 	struct prestera_switch *sw = port->sw;
 	struct prestera_bridge *bridge;
 	struct prestera_bridge_port *br_port;
+	struct net_device *port_upper;
 
 	bridge = prestera_bridge_find(sw, br_dev);
 	if (!bridge)
@@ -1514,10 +1693,14 @@ void prestera_port_bridge_leave(struct prestera_port *port,
 	prestera_port_vid_stp_set(port, PRESTERA_VID_ALL, BR_STATE_FORWARDING);
 	prestera_bridge_port_put(sw, br_port);
 
-	/* Offload rif that was previosly disabled */
+	/* Offload RIF that was previosly disabled */
 	if (prestera_rif_exists(sw, port->net_dev))
 		prestera_rif_enable(sw, port->net_dev, true);
 
+	if (port_upper &&
+	    netif_is_lag_master(port_upper) &&
+	    prestera_rif_exists(sw, port_upper))
+		prestera_rif_enable(sw, port_upper, true);
 }
 
 static int prestera_fdb_init(struct prestera_switch *sw)
@@ -1610,6 +1793,12 @@ static int prestera_br_mdb_port_add(struct prestera_br_mdb_entry *br_mdb,
 				    struct prestera_bridge_port *br_port)
 {
 	struct prestera_br_mdb_port *br_mdb_port;
+
+	list_for_each_entry(br_mdb_port, &br_mdb->br_mdb_port_list,
+			    br_mdb_port_node) {
+		if (br_mdb_port->br_port == br_port)
+			return 0;
+	}
 
 	br_mdb_port = kzalloc(sizeof(*br_mdb_port), GFP_KERNEL);
 	if (!br_mdb_port)
@@ -1806,8 +1995,13 @@ int prestera_switchdev_init(struct prestera_switch *sw)
 		return -ENOMEM;
 
 	sw->swdev = swdev;
+	swdev->sw = sw;
 
 	INIT_LIST_HEAD(&sw->swdev->bridge_list);
+	err = rhashtable_init(&sw->swdev->routed_fdb_ht,
+			      &__prestera_routed_fdb_ht_params);
+	if (err)
+		goto err_init_rfdb_ht;
 
 	swdev_owq = alloc_ordered_workqueue("%s_ordered", 0, "prestera_sw");
 	if (!swdev_owq) {
@@ -1835,6 +2029,8 @@ err_register_block_switchdev_notifier:
 err_register_switchdev_notifier:
 	destroy_workqueue(swdev_owq);
 err_alloc_workqueue:
+	rhashtable_destroy(&sw->swdev->routed_fdb_ht);
+err_init_rfdb_ht:
 	kfree(swdev);
 	return err;
 }
@@ -1849,6 +2045,7 @@ void prestera_switchdev_fini(struct prestera_switch *sw)
 	    (&sw->swdev->swdev_blocking_n);
 	flush_workqueue(swdev_owq);
 	destroy_workqueue(swdev_owq);
+	rhashtable_destroy(&sw->swdev->routed_fdb_ht);
 	kfree(sw->swdev);
 	sw->swdev = NULL;
 }
