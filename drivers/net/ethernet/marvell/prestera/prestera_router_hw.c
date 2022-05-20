@@ -235,7 +235,7 @@ static int __prestera_rif_entry_macvlan_add(const struct prestera_switch *sw,
 	 * Now it is inconsistent.
 	 */
 	err = prestera_hw_macvlan_add(sw, e->vr->hw_vr_id, addr,
-				      e->key.iface.vlan_id);
+				      e->key.iface.vlan_id, &e->key.iface);
 	if (err)
 		goto err_hw;
 
@@ -258,7 +258,7 @@ __prestera_rif_entry_macvlan_del(const struct prestera_switch *sw,
 	int err;
 
 	err = prestera_hw_macvlan_del(sw, e->vr->hw_vr_id, n->addr,
-				      e->key.iface.vlan_id);
+				      e->key.iface.vlan_id, &e->key.iface);
 	if (err)
 		pr_err("%s:%d failed to delete macvlan from hw err = %d",
 		       __func__, __LINE__, err);

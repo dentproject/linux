@@ -36,6 +36,9 @@ enum prestera_cmd_type_t {
 	PRESTERA_CMD_TYPE_SWITCH_SCT_RATELIMIT_SET = 0x5,
 	PRESTERA_CMD_TYPE_SWITCH_SCT_RATELIMIT_GET = 0x6,
 
+	PRESTERA_CMD_TYPE_IPG_GET = 0xFE,
+	PRESTERA_CMD_TYPE_IPG_SET = 0xFF,
+
 	PRESTERA_CMD_TYPE_PORT_ATTR_SET = 0x100,
 	PRESTERA_CMD_TYPE_PORT_ATTR_GET = 0x101,
 	PRESTERA_CMD_TYPE_PORT_INFO_GET = 0x110,
@@ -53,6 +56,8 @@ enum prestera_cmd_type_t {
 	PRESTERA_CMD_TYPE_FDB_FLUSH_PORT_VLAN = 0x312,
 	PRESTERA_CMD_TYPE_FDB_MACVLAN_ADD = 0x320,
 	PRESTERA_CMD_TYPE_FDB_MACVLAN_DEL = 0x321,
+	PRESTERA_CMD_TYPE_FDB_ROUTED_ADD = 0x322,
+	PRESTERA_CMD_TYPE_FDB_ROUTED_DEL = 0x323,
 
 	PRESTERA_CMD_TYPE_LOG_LEVEL_SET,
 
@@ -674,6 +679,10 @@ struct prestera_msg_macvlan_req {
 	__le16 vid;
 	u8 mac[ETH_ALEN];
 	u8 pad[2];
+	/* iface will be removed as well as vr_id during fw logic migration
+	 * For now it is necessary to calculate priv vid on fw side
+	 */
+	struct prestera_msg_iface iface;
 };
 
 struct prestera_msg_stp_req {
@@ -925,6 +934,16 @@ struct prestera_msg_sct_ratelimit_get_resp {
 	u32 rate_pps;
 };
 
+struct prestera_msg_ipg_set_req {
+	struct prestera_msg_cmd cmd;
+	u32 ipg;
+} __packed __aligned(4);
+
+struct prestera_msg_ipg_get_resp {
+	struct prestera_msg_ret ret;
+	u32 ipg;
+} __packed __aligned(4);
+
 static void prestera_hw_build_tests(void)
 {
 	/* check requests */
@@ -949,7 +968,7 @@ static void prestera_hw_build_tests(void)
 	BUILD_BUG_ON(sizeof(struct prestera_msg_counter_stats) != 16);
 	BUILD_BUG_ON(sizeof(struct prestera_msg_nh_mangle_req) != 52);
 	BUILD_BUG_ON(sizeof(struct prestera_msg_nat_port_req) != 20);
-	BUILD_BUG_ON(sizeof(struct prestera_msg_macvlan_req) != 16);
+	BUILD_BUG_ON(sizeof(struct prestera_msg_macvlan_req) != 32);
 	BUILD_BUG_ON(sizeof(struct prestera_msg_rif_req) != 36);
 	BUILD_BUG_ON(sizeof(struct prestera_msg_lpm_req) != 36);
 	BUILD_BUG_ON(sizeof(struct prestera_msg_nh_req) != 124);
@@ -1100,6 +1119,8 @@ struct prestera_fw_event_handler {
 
 static void prestera_hw_remote_fc_to_eth(u8 fc, bool *pause, bool *asym_pause);
 static u8 prestera_hw_mdix_to_eth(u8 mode);
+static int prestera_iface_to_msg(struct prestera_iface *iface,
+				 struct prestera_msg_iface *msg_if);
 
 static void prestera_fw_wdog_restart(struct prestera_device *dev)
 {
@@ -1897,12 +1918,18 @@ int prestera_hw_bridge_port_delete(const struct prestera_port *port,
 }
 
 int prestera_hw_macvlan_add(const struct prestera_switch *sw, u16 vr_id,
-			    const u8 *mac, u16 vid)
+			    const u8 *mac, u16 vid,
+			    struct prestera_iface *iface)
 {
 	struct prestera_msg_macvlan_req req = {
-		.vr_id = __cpu_to_le16(vr_id),
+		.vr_id = 0,
 		.vid = __cpu_to_le16(vid)
 	};
+	int err;
+
+	err = prestera_iface_to_msg(iface, &req.iface);
+	if (err)
+		return err;
 
 	memcpy(req.mac, mac, ETH_ALEN);
 
@@ -1910,16 +1937,50 @@ int prestera_hw_macvlan_add(const struct prestera_switch *sw, u16 vr_id,
 }
 
 int prestera_hw_macvlan_del(const struct prestera_switch *sw, u16 vr_id,
-			    const u8 *mac, u16 vid)
+			    const u8 *mac, u16 vid,
+			    struct prestera_iface *iface)
 {
 	struct prestera_msg_macvlan_req req = {
-		.vr_id = __cpu_to_le16(vr_id),
+		.vr_id = 0,
 		.vid = __cpu_to_le16(vid)
 	};
+	int err;
+
+	err = prestera_iface_to_msg(iface, &req.iface);
+	if (err)
+		return err;
 
 	memcpy(req.mac, mac, ETH_ALEN);
 
 	return fw_send_req(sw, PRESTERA_CMD_TYPE_FDB_MACVLAN_DEL, &req);
+}
+
+int prestera_hw_fdb_routed_add(const struct prestera_switch *sw,
+			       const u8 *mac, u16 vid)
+{
+	struct prestera_msg_macvlan_req req = {
+		.vr_id = 0,
+		.vid = __cpu_to_le16(vid)
+	};
+
+	req.iface.type = PRESTERA_IF_VID_E;
+	memcpy(req.mac, mac, ETH_ALEN);
+
+	return fw_send_req(sw, PRESTERA_CMD_TYPE_FDB_ROUTED_ADD, &req);
+}
+
+int prestera_hw_fdb_routed_del(const struct prestera_switch *sw,
+			       const u8 *mac, u16 vid)
+{
+	struct prestera_msg_macvlan_req req = {
+		.vr_id = 0,
+		.vid = __cpu_to_le16(vid)
+	};
+
+	req.iface.type = PRESTERA_IF_VID_E;
+	memcpy(req.mac, mac, ETH_ALEN);
+
+	return fw_send_req(sw, PRESTERA_CMD_TYPE_FDB_ROUTED_DEL, &req);
 }
 
 int prestera_hw_fdb_flush_port(const struct prestera_port *port, u32 mode)
@@ -3059,6 +3120,30 @@ int prestera_hw_mdb_destroy(struct prestera_mdb_entry *mdb)
 	memcpy(req.mac, mdb->addr, ETH_ALEN);
 
 	return fw_send_req(mdb->sw, PRESTERA_CMD_TYPE_MDB_DESTROY, &req);
+}
+
+int prestera_hw_ipg_set(struct prestera_switch *sw, u32 ipg)
+{
+	struct prestera_msg_ipg_set_req req = {
+		.ipg = ipg,
+	};
+
+	return fw_send_req(sw, PRESTERA_CMD_TYPE_IPG_SET, &req);
+}
+
+int prestera_hw_ipg_get(struct prestera_switch *sw, u32 *ipg)
+{
+	struct prestera_msg_ipg_get_resp resp;
+	struct prestera_msg_common_req req;
+	int err;
+
+	err = fw_send_req_resp(sw, PRESTERA_CMD_TYPE_IPG_GET, &req, &resp);
+	if (err)
+		return err;
+
+	*ipg = resp.ipg;
+
+	return 0;
 }
 
 int prestera_hw_sched_create(const struct prestera_switch *sw, u32 *sched_id)

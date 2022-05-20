@@ -29,6 +29,13 @@ static ssize_t prestera_cnt_read(struct file *file, char __user *ubuf,
 				 size_t count, loff_t *ppos);
 
 static ssize_t
+prestera_ipg_write(struct file *file, const char __user *ubuf,
+		   size_t count, loff_t *ppos);
+static ssize_t
+prestera_ipg_read(struct file *file, char __user *ubuf,
+		  size_t count, loff_t *ppos);
+
+static ssize_t
 prestera_sct_cfg_read(struct file *file, char __user *ubuf,
 		      size_t count, loff_t *ppos);
 static ssize_t
@@ -38,6 +45,7 @@ prestera_sct_cfg_write(struct file *file, const char __user *ubuf,
 struct prestera_debugfs {
 	struct dentry *root_dir;
 	const struct file_operations cpu_code_cnt_fops;
+	const struct file_operations ipg_fops;
 	const struct file_operations sct_cfg_fops;
 	char *cpu_code_cnt_buf;
 	const char *sct_cfg_fname[PRESTERA_SCT_MAX];
@@ -59,6 +67,12 @@ struct prestera_cpu_code_data {
 static struct prestera_debugfs prestera_debugfs = {
 	.cpu_code_cnt_fops = {
 		.read = prestera_cnt_read,
+		.open = simple_open,
+		.llseek = default_llseek,
+	},
+	.ipg_fops = {
+		.read = prestera_ipg_read,
+		.write = prestera_ipg_write,
 		.open = simple_open,
 		.llseek = default_llseek,
 	},
@@ -110,6 +124,21 @@ enum {
 	CPU_CODE_CNT_TYPE_HW_TRAP = PRESTERA_HW_CPU_CODE_CNT_TYPE_TRAP,
 	CPU_CODE_CNT_TYPE_SW_TRAP = CPU_CODE_CNT_TYPE_HW_TRAP + 1,
 };
+
+static int prestera_debugfs_ipg_init(struct prestera_switch *sw)
+{
+	struct prestera_debugfs *debugfs = &prestera_debugfs;
+	const struct file_operations *fops =
+		&prestera_debugfs.ipg_fops;
+	struct dentry *debugfs_file;
+
+	debugfs_file = debugfs_create_file("ipg", 0644, debugfs->root_dir, NULL,
+					   fops);
+	if (PTR_ERR_OR_ZERO(debugfs_file))
+		return (int)PTR_ERR(debugfs_file);
+
+	return 0;
+}
 
 static ssize_t
 prestera_sct_cfg_read(struct file *file, char __user *ubuf,
@@ -332,6 +361,10 @@ int prestera_debugfs_init(struct prestera_switch *sw)
 		goto err_single_file_creation;
 	}
 
+	err = prestera_debugfs_ipg_init(sw);
+	if (err)
+		goto err_ipg_init;
+
 	err = prestera_debugfs_sct_init();
 	if (err)
 		goto sct_init_failed;
@@ -339,6 +372,7 @@ int prestera_debugfs_init(struct prestera_switch *sw)
 	return 0;
 
 sct_init_failed:
+err_ipg_init:
 err_single_file_creation:
 err_subdir_alloc:
 	/*
@@ -432,4 +466,47 @@ err_get_stats:
 	mutex_unlock(&prestera_debugfs.cpu_code_cnt_buf_mtx);
 
 	return ret;
+}
+
+static ssize_t
+prestera_ipg_write(struct file *file, const char __user *ubuf,
+		   size_t count, loff_t *ppos)
+{
+	struct prestera_debugfs *debugfs = &prestera_debugfs;
+	char buf[128] = { 0 };
+	u32 ipg;
+	int ret;
+
+	ret = simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, ubuf, count);
+	if (ret < 0)
+		return -EINVAL;
+
+	if (kstrtou32(buf, 0, &ipg) || !ipg || ipg % PRESTERA_IPG_ALIGN_VALUE)
+		return -EINVAL;
+
+	ret = prestera_hw_ipg_set(debugfs->sw, ipg);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static ssize_t
+prestera_ipg_read(struct file *file, char __user *ubuf,
+		  size_t count, loff_t *ppos)
+{
+	struct prestera_debugfs *debugfs = &prestera_debugfs;
+	char buf[128] = { 0 };
+	/* as the snprintf doesn't count for \0, start with 1 */
+	int buf_len = 1;
+	int ret;
+	u32 ipg;
+
+	ret = prestera_hw_ipg_get(debugfs->sw, &ipg);
+	if (ret)
+		return ret;
+
+	buf_len += snprintf(buf, sizeof(buf) - 1, "ipg: %u\n", ipg);
+
+	return simple_read_from_buffer(ubuf, count, ppos, buf, buf_len);
 }
