@@ -103,11 +103,27 @@ struct mvsw_pr_kern_fib_cache {
 	};
 };
 
+/* This is definition to hold links to kern_neigh_cache.
+ * Used for techincal purposes.
+ */
+struct prestera_kern_nc_lnode {
+	struct list_head head;
+	struct prestera_kern_neigh_cache *nc;
+};
+
 static const struct rhashtable_params __mvsw_pr_kern_neigh_cache_ht_params = {
 	.key_offset  = offsetof(struct prestera_kern_neigh_cache, key),
 	.head_offset = offsetof(struct prestera_kern_neigh_cache, ht_node),
 	.key_len     = sizeof(struct prestera_kern_neigh_cache_key),
 	.automatic_shrinking = true,
+};
+
+/* This is definition to hold links to kern_fib_cache.
+ * Used for techincal purposes.
+ */
+struct prestera_kern_fc_lnode {
+	struct list_head head;
+	struct mvsw_pr_kern_fib_cache *fc;
 };
 
 static const struct rhashtable_params __mvsw_pr_kern_fib_cache_ht_params = {
@@ -1789,11 +1805,11 @@ __mvsw_pr_k_arb_fc_rebuild(struct prestera_switch *sw,
 	bool reachable;
 
 	memcpy(&key, &fc->key, sizeof(key));
-	if (fc->key.addr.v == PRESTERA_IPV4) {
+	if (key.addr.v == PRESTERA_IPV4) {
 		memcpy(&fen4_info, &fc->fen4_info, sizeof(fen4_info));
 		fib_info_hold(fen4_info.fi);
 		info = &fen4_info.info;
-	} else if (fc->key.addr.v == PRESTERA_IPV6) {
+	} else if (key.addr.v == PRESTERA_IPV6) {
 		memcpy(&fen6_info, &fc->fen6_info, sizeof(fen6_info));
 		fib6_info_hold(fen6_info.rt);
 		info = &fen6_info.info;
@@ -1807,9 +1823,9 @@ __mvsw_pr_k_arb_fc_rebuild(struct prestera_switch *sw,
 	mvsw_pr_kern_fib_cache_destroy(sw, fc);
 
 	new_fc = prestera_kern_fib_cache_create(sw, &key, info);
-	if (fc->key.addr.v == PRESTERA_IPV4)
+	if (key.addr.v == PRESTERA_IPV4)
 		fib_info_put(fen4_info.fi);
-	else if (fc->key.addr.v == PRESTERA_IPV6)
+	else if (key.addr.v == PRESTERA_IPV6)
 		fib6_info_release(fen6_info.rt);
 
 	if (!new_fc)
@@ -1824,64 +1840,72 @@ __mvsw_pr_k_arb_fc_rebuild(struct prestera_switch *sw,
 static void mvsw_pr_k_arb_rif_evt(struct prestera_switch *sw,
 				  struct prestera_rif *rif)
 {
-	struct mvsw_pr_kern_fib_cache *fc, *tfc, *nfc;
-	struct prestera_kern_neigh_cache *nc, *tnc;
+	struct prestera_kern_nc_lnode *nc_lnode;
+	struct prestera_kern_fc_lnode *fc_lnode;
+	struct prestera_kern_neigh_cache *nc;
+	struct mvsw_pr_kern_fib_cache *fc;
 	struct rhashtable_iter iter;
+	struct list_head tmp_list;
 
 	/* Walk every fc, which related to rif and set to trap */
-	tfc = NULL;
+	INIT_LIST_HEAD(&tmp_list);
 	rhashtable_walk_enter(&sw->router->kern_fib_cache_ht, &iter);
 	rhashtable_walk_start(&iter);
-	while (1) {
-		fc = rhashtable_walk_next(&iter);
-		if (tfc && prestera_util_fi_is_point2dev(&tfc->info, rif->dev)) {
-			rhashtable_walk_stop(&iter);
-			nfc = __mvsw_pr_k_arb_fc_rebuild(sw, tfc);
-			rhashtable_walk_start(&iter);
-			/* TODO: way to crash ? */
-			if (WARN_ON(!nfc))
-				MVSW_LOG_ERROR("Rebuild failed %pI4n/%d",
-					       &tfc->key.addr.u.ipv4,
-					       tfc->key.prefix_len);
-		}
-
-		if (!fc)
-			break;
-
-		tfc = NULL;
+	while ((fc = rhashtable_walk_next(&iter))) {
 		if (IS_ERR(fc))
 			continue;
 
-		tfc = fc;
+		if (prestera_util_fi_is_point2dev(&fc->info, rif->dev)) {
+			fc_lnode = kzalloc(sizeof(*fc_lnode), GFP_ATOMIC);
+			if (WARN_ON(!fc_lnode))
+				break;
+
+			fc_lnode->fc = fc;
+			list_add(&fc_lnode->head, &tmp_list);
+		}
 	}
 	rhashtable_walk_stop(&iter);
 	rhashtable_walk_exit(&iter);
+	while (!list_empty(&tmp_list)) {
+		fc_lnode = list_last_entry(&tmp_list,
+					   struct prestera_kern_fc_lnode, head);
+
+		WARN_ON(!__mvsw_pr_k_arb_fc_rebuild(sw, fc_lnode->fc));
+
+		list_del(&fc_lnode->head);
+		kfree(fc_lnode);
+	}
 
 	/* Destroy every nc, which related to rif */
-	tnc = NULL;
+	INIT_LIST_HEAD(&tmp_list);
 	rhashtable_walk_enter(&sw->router->kern_neigh_cache_ht, &iter);
 	rhashtable_walk_start(&iter);
-	while (1) {
-		nc = rhashtable_walk_next(&iter);
-		if (tnc && tnc->key.rif == rif) {
-			tnc->in_kernel = false;
-			rhashtable_walk_stop(&iter);
-			__mvsw_pr_k_arb_nc_apply(sw, tnc);
-			WARN_ON(mvsw_pr_kern_neigh_cache_put(sw, tnc));
-			rhashtable_walk_start(&iter);
-		}
-
-		if (!nc)
-			break;
-
-		tnc = NULL;
+	while ((nc = rhashtable_walk_next(&iter))) {
 		if (IS_ERR(nc))
 			continue;
 
-		tnc = nc;
+		if (nc->key.rif == rif) {
+			nc_lnode = kzalloc(sizeof(*nc_lnode), GFP_ATOMIC);
+			if (WARN_ON(!nc_lnode))
+				break;
+
+			nc_lnode->nc = nc;
+			list_add(&nc_lnode->head, &tmp_list);
+		}
 	}
 	rhashtable_walk_stop(&iter);
 	rhashtable_walk_exit(&iter);
+	while (!list_empty(&tmp_list)) {
+		nc_lnode = list_last_entry(&tmp_list,
+					   struct prestera_kern_nc_lnode, head);
+
+		nc_lnode->nc->in_kernel = false;
+		__mvsw_pr_k_arb_nc_apply(sw, nc_lnode->nc);
+		WARN_ON(mvsw_pr_kern_neigh_cache_put(sw, nc_lnode->nc));
+
+		list_del(&nc_lnode->head);
+		kfree(nc_lnode);
+	}
 }
 
 struct mvsw_pr_netevent_work {
@@ -2325,7 +2349,7 @@ static int __mvsw_pr_inetaddr_event(struct prestera_switch *sw,
 		return mvsw_pr_inetaddr_vlan_event(sw, dev, event, extack);
 	else if (netif_is_bridge_master(dev))
 		return mvsw_pr_inetaddr_bridge_event(sw, dev, event, extack);
-	else if (netif_is_lag_master(dev))
+	else if (netif_is_lag_master(dev) && !netif_is_bridge_port(dev))
 		return mvsw_pr_inetaddr_lag_event(sw, dev, event, extack);
 	else if (netif_is_macvlan(dev))
 		return mvsw_pr_inetaddr_macvlan_event(sw, dev, event, extack);

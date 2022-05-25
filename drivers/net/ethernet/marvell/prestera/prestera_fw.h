@@ -67,7 +67,7 @@ struct prestera_fw_regs {
 
 #define PRESTERA_SUPP_FW_MAJ_VER	3
 #define PRESTERA_SUPP_FW_MIN_VER	2
-#define PRESTERA_SUPP_FW_PATCH_VER	1
+#define PRESTERA_SUPP_FW_PATCH_VER	2
 
 struct prestera_fw_evtq {
 	u8 __iomem *addr;

@@ -32,6 +32,9 @@
 #define PRESTERA_SPAN_INVALID_ID -1
 #define PRESTERA_QOS_SP_COUNT 8
 
+#define PRESTERA_IPG_DEFAULT_VALUE (12)
+#define PRESTERA_IPG_ALIGN_VALUE (4)
+
 struct prestera_fw_rev {
 	u16 maj;
 	u16 min;
