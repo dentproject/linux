@@ -6,7 +6,9 @@
 #include "prestera_acl.h"
 #include "prestera_log.h"
 #include "prestera_hw.h"
+#include "prestera_flow.h"
 #include "prestera_flower.h"
+#include "prestera_matchall.h"
 
 #define PRESTERA_DEFAULT_TC_NUM	8
 
@@ -61,11 +63,11 @@ prestera_flower_parse_goto_action(struct prestera_flow_block *block,
 	return 0;
 }
 
-static int mvsw_pr_flower_parse_actions(struct prestera_flow_block *block,
-					struct prestera_acl_rule *rule,
-					struct flow_action *flow_action,
-					u32 chain_index,
-					struct netlink_ext_ack *extack)
+static int prestera_flower_parse_actions(struct prestera_flow_block *block,
+					 struct prestera_acl_rule *rule,
+					 struct flow_action *flow_action,
+					 u32 chain_index,
+					 struct netlink_ext_ack *extack)
 {
 	const struct flow_action_entry *act;
 	struct prestera_flow_block_binding *binding;
@@ -120,9 +122,10 @@ static int mvsw_pr_flower_parse_actions(struct prestera_flow_block *block,
 				return -EEXIST;
 
 			rule->re_arg.police.valid = 1;
-			rule->re_arg.police.i.rate =
+			rule->re_arg.police.rate =
 				act->police.rate_bytes_ps;
-			rule->re_arg.police.i.burst = act->police.burst;
+			rule->re_arg.police.burst = act->police.burst;
+			rule->re_arg.police.ingress = block->ingress;
 			break;
 		case FLOW_ACTION_GOTO:
 			err = prestera_flower_parse_goto_action(block, rule,
@@ -183,9 +186,9 @@ static int mvsw_pr_flower_parse_actions(struct prestera_flow_block *block,
 	return 0;
 }
 
-static int mvsw_pr_flower_parse_meta(struct prestera_acl_rule *rule,
-				     struct flow_cls_offload *f,
-				     struct prestera_flow_block *block)
+static int prestera_flower_parse_meta(struct prestera_acl_rule *rule,
+				      struct flow_cls_offload *f,
+				      struct prestera_flow_block *block)
 {
 	struct flow_rule *f_rule = flow_cls_offload_flow_rule(f);
 	struct prestera_acl_match *r_match = &rule->re_key.match;
@@ -201,7 +204,7 @@ static int mvsw_pr_flower_parse_meta(struct prestera_acl_rule *rule,
 		return -EINVAL;
 	}
 
-	ingress_dev = __dev_get_by_index(prestera_acl_block_net(block),
+	ingress_dev = __dev_get_by_index(block->net,
 					 match.key->ingress_ifindex);
 	if (!ingress_dev) {
 		NL_SET_ERR_MSG_MOD(f->common.extack,
@@ -216,9 +219,8 @@ static int mvsw_pr_flower_parse_meta(struct prestera_acl_rule *rule,
 	}
 	port = netdev_priv(ingress_dev);
 
-	mask = htons(0x1FFF << 3);
-	key = htons(port->hw_id << 3);
-
+	mask = htons(0x1FFF);
+	key = htons(port->hw_id);
 	rule_match_set(r_match->key, SYS_PORT, key);
 	rule_match_set(r_match->mask, SYS_PORT, mask);
 
@@ -230,9 +232,9 @@ static int mvsw_pr_flower_parse_meta(struct prestera_acl_rule *rule,
 	return 0;
 }
 
-static int mvsw_pr_flower_parse(struct prestera_flow_block *block,
-				struct prestera_acl_rule *rule,
-				struct flow_cls_offload *f)
+static int prestera_flower_parse(struct prestera_flow_block *block,
+				 struct prestera_acl_rule *rule,
+				 struct flow_cls_offload *f)
 {
 	struct flow_rule *f_rule = flow_cls_offload_flow_rule(f);
 	struct flow_dissector *dissector = f_rule->match.dissector;
@@ -278,7 +280,7 @@ static int mvsw_pr_flower_parse(struct prestera_flow_block *block,
 	prestera_acl_rule_priority_set(rule, f->common.prio);
 
 	if (flow_rule_match_key(f_rule, FLOW_DISSECTOR_KEY_META)) {
-		err = mvsw_pr_flower_parse_meta(rule, f, block);
+		err = prestera_flower_parse_meta(rule, f, block);
 		if (err)
 			return err;
 	}
@@ -354,6 +356,30 @@ static int mvsw_pr_flower_parse(struct prestera_flow_block *block,
 		rule_match_set(r_match->mask, IP_DST, match.mask->dst);
 	}
 
+	if (addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
+		struct flow_match_ipv6_addrs match;
+
+		flow_rule_match_ipv6_addrs(f_rule, &match);
+
+		rule_match_set(r_match->key, IPV6_SRC_0, match.key->src.in6_u.u6_addr32[0]);
+		rule_match_set(r_match->key, IPV6_SRC_1, match.key->src.in6_u.u6_addr32[1]);
+		rule_match_set(r_match->key, IPV6_SRC_2, match.key->src.in6_u.u6_addr32[2]);
+		rule_match_set(r_match->key, IPV6_SRC_3, match.key->src.in6_u.u6_addr32[3]);
+		rule_match_set(r_match->mask, IPV6_SRC_0, match.mask->src.in6_u.u6_addr32[0]);
+		rule_match_set(r_match->mask, IPV6_SRC_1, match.mask->src.in6_u.u6_addr32[1]);
+		rule_match_set(r_match->mask, IPV6_SRC_2, match.mask->src.in6_u.u6_addr32[2]);
+		rule_match_set(r_match->mask, IPV6_SRC_3, match.mask->src.in6_u.u6_addr32[3]);
+
+		rule_match_set(r_match->key, IPV6_DST_0, match.key->dst.in6_u.u6_addr32[0]);
+		rule_match_set(r_match->key, IPV6_DST_1, match.key->dst.in6_u.u6_addr32[1]);
+		rule_match_set(r_match->key, IPV6_DST_2, match.key->dst.in6_u.u6_addr32[2]);
+		rule_match_set(r_match->key, IPV6_DST_3, match.key->dst.in6_u.u6_addr32[3]);
+		rule_match_set(r_match->mask, IPV6_DST_0, match.mask->dst.in6_u.u6_addr32[0]);
+		rule_match_set(r_match->mask, IPV6_DST_1, match.mask->dst.in6_u.u6_addr32[1]);
+		rule_match_set(r_match->mask, IPV6_DST_2, match.mask->dst.in6_u.u6_addr32[2]);
+		rule_match_set(r_match->mask, IPV6_DST_3, match.mask->dst.in6_u.u6_addr32[3]);
+	}
+
 	if (flow_rule_match_key(f_rule, FLOW_DISSECTOR_KEY_PORTS)) {
 		struct flow_match_ports match;
 
@@ -425,44 +451,53 @@ static int mvsw_pr_flower_parse(struct prestera_flow_block *block,
 		rule_match_set(r_match->mask, ICMP_CODE, match.mask->code);
 	}
 
-	return mvsw_pr_flower_parse_actions(block, rule, &f->rule->action,
-					    f->common.chain_index,
-					    f->common.extack);
+	return prestera_flower_parse_actions(block, rule, &f->rule->action,
+					     f->common.chain_index,
+					     f->common.extack);
 }
 
 static int prestera_flower_prio_check(struct prestera_flow_block *block,
 				      struct flow_cls_offload *f)
 {
-	u32 mall_prio;
+	u32 mall_prio_min;
+	u32 mall_prio_max;
 	int err;
 
-	err = prestera_mall_prio_get(block, &mall_prio);
+	err = prestera_mall_prio_get(block, &mall_prio_min, &mall_prio_max);
 	if (err == -ENOENT)
+		/* No matchall filters installed on this chain. */
 		return 0;
-	if (err)
+
+	if (err) {
+		NL_SET_ERR_MSG(f->common.extack, "Failed to get matchall priorities");
 		return err;
+	}
 
-	if (f->common.prio <= mall_prio)
+	if (f->common.prio <= mall_prio_max && block->ingress) {
+		NL_SET_ERR_MSG(f->common.extack,
+			       "Failed to add in front of existing matchall rules");
 		return -EOPNOTSUPP;
+	}
+	if (f->common.prio >= mall_prio_min && !block->ingress) {
+		NL_SET_ERR_MSG(f->common.extack, "Failed to add behind of existing matchall rules");
+		return -EOPNOTSUPP;
+	}
 
 	return 0;
 }
 
-int prestera_flower_prio_get(struct prestera_flow_block *block,
-			     u32 *prio)
+int prestera_flower_prio_get(struct prestera_flow_block *block, u32 chain_index,
+			     u32 *prio_min, u32 *prio_max)
 {
-	if (!prestera_acl_block_rule_count(block))
-		return -ENOENT;
+	struct prestera_acl_ruleset *ruleset;
 
-	*prio = block->flower_min_prio;
+	ruleset = prestera_acl_ruleset_lookup(block->sw->acl, block, chain_index);
+	if (IS_ERR(ruleset))
+		return PTR_ERR(ruleset);
+
+	prestera_acl_ruleset_prio_get(ruleset, prio_min, prio_max);
+	prestera_acl_ruleset_put(ruleset);
 	return 0;
-}
-
-static void prestera_flower_prio_update(struct prestera_flow_block *block,
-					u32 prio)
-{
-	if (prio < block->flower_min_prio)
-		block->flower_min_prio = prio;
 }
 
 int prestera_flower_replace(struct prestera_flow_block *block,
@@ -489,7 +524,7 @@ int prestera_flower_replace(struct prestera_flow_block *block,
 		goto err_rule_create;
 	}
 
-	err = mvsw_pr_flower_parse(block, rule, f);
+	err = prestera_flower_parse(block, rule, f);
 	if (err)
 		goto err_rule_add;
 
@@ -502,8 +537,6 @@ int prestera_flower_replace(struct prestera_flow_block *block,
 	err = prestera_acl_rule_add(block->sw, rule);
 	if (err)
 		goto err_rule_add;
-
-	prestera_flower_prio_update(block, f->common.prio);
 
 	prestera_acl_ruleset_put(ruleset);
 	return 0;
@@ -544,7 +577,7 @@ int prestera_flower_tmplt_create(struct prestera_flow_block *block,
 	int err;
 
 	memset(&rule, 0, sizeof(rule));
-	err = mvsw_pr_flower_parse(block, &rule, f);
+	err = prestera_flower_parse(block, &rule, f);
 	if (err)
 		return err;
 
@@ -582,7 +615,7 @@ int prestera_flower_tmplt_create(struct prestera_flow_block *block,
 err_ruleset_get:
 	kfree(template);
 err_malloc:
-	MVSW_LOG_ERROR("Create chain template failed");
+	NL_SET_ERR_MSG_MOD(f->common.extack, "Create chain template failed");
 	return err;
 }
 

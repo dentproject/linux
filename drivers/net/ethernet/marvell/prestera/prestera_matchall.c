@@ -6,82 +6,57 @@
 
 #include "prestera.h"
 #include "prestera_hw.h"
+#include "prestera_flow.h"
 #include "prestera_flower.h"
-
-static int prestera_mall_rule_add(struct prestera_flow_block_binding *binding,
-				  struct prestera_port *to_port)
-{
-	int err;
-	u8 span_id;
-	struct prestera_switch *sw = binding->port->sw;
-
-	if (binding->span_id != PRESTERA_SPAN_INVALID_ID)
-		/* port already in mirroring */
-		return -EEXIST;
-
-	err = prestera_span_get(to_port, &span_id);
-	if (err)
-		return err;
-
-	err = prestera_hw_span_bind(binding->port, span_id);
-	if (err) {
-		prestera_span_put(sw, span_id);
-		return err;
-	}
-
-	binding->span_id = span_id;
-	return 0;
-}
-
-static int prestera_mall_rule_del(struct prestera_flow_block_binding *binding)
-{
-	int err;
-
-	err = prestera_hw_span_unbind(binding->port);
-	if (err)
-		return err;
-
-	err = prestera_span_put(binding->port->sw, binding->span_id);
-	if (err)
-		return err;
-
-	binding->span_id = PRESTERA_SPAN_INVALID_ID;
-	return 0;
-}
+#include "prestera_matchall.h"
+#include "prestera_span.h"
 
 static int prestera_mall_prio_check(struct prestera_flow_block *block,
 				    struct tc_cls_matchall_offload *f)
 {
-	u32 flower_prio;
+	u32 flower_prio_min;
+	u32 flower_prio_max;
 	int err;
 
-	err = prestera_flower_prio_get(block, &flower_prio);
+	err = prestera_flower_prio_get(block, f->common.chain_index,
+				       &flower_prio_min, &flower_prio_max);
 	if (err == -ENOENT)
+		/* No flower filters installed on this chain. */
 		return 0;
-	if (err)
-		return err;
 
-	if (f->common.prio >= flower_prio)
+	if (err) {
+		NL_SET_ERR_MSG(f->common.extack, "Failed to get flower priorities");
+		return err;
+	}
+
+	if (f->common.prio <= flower_prio_max && !block->ingress) {
+		NL_SET_ERR_MSG(f->common.extack, "Failed to add in front of existing flower rules");
 		return -EOPNOTSUPP;
+	}
+	if (f->common.prio >= flower_prio_min && block->ingress) {
+		NL_SET_ERR_MSG(f->common.extack, "Failed to add behind of existing flower rules");
+		return -EOPNOTSUPP;
+	}
 
 	return 0;
 }
 
 int prestera_mall_prio_get(struct prestera_flow_block *block,
-			   u32 *prio)
+			   u32 *prio_min, u32 *prio_max)
 {
-	if (block->mall_prio == UINT_MAX)
+	if (!block->mall.bound)
 		return -ENOENT;
 
-	*prio = block->mall_prio;
+	*prio_min = block->mall.prio_min;
+	*prio_max = block->mall.prio_max;
 	return 0;
 }
 
 static void prestera_mall_prio_update(struct prestera_flow_block *block,
 				      struct tc_cls_matchall_offload *f)
 {
-	if (f->common.prio > block->mall_prio || block->mall_prio == UINT_MAX)
-		block->mall_prio = f->common.prio;
+	block->mall.prio_min = min(block->mall.prio_min, f->common.prio);
+	block->mall.prio_max = max(block->mall.prio_max, f->common.prio);
 }
 
 int prestera_mall_replace(struct prestera_flow_block *block,
@@ -101,9 +76,17 @@ int prestera_mall_replace(struct prestera_flow_block *block,
 
 	act = &f->rule->action.entries[0];
 
+	if (!prestera_netdev_check(act->dev)) {
+		NL_SET_ERR_MSG(f->common.extack,
+			       "Only Marvell Prestera port is supported");
+		return -EINVAL;
+	}
+	if (!tc_cls_can_offload_and_chain0(act->dev, &f->common)) {
+		NL_SET_ERR_MSG(f->common.extack, "Only chain 0 is supported");
+		return -EOPNOTSUPP;
+	}
 	if (act->id != FLOW_ACTION_MIRRED)
 		return -EOPNOTSUPP;
-
 	if (protocol != htons(ETH_P_ALL))
 		return -EOPNOTSUPP;
 
@@ -111,15 +94,10 @@ int prestera_mall_replace(struct prestera_flow_block *block,
 	if (err)
 		return err;
 
-	if (!prestera_netdev_check(act->dev)) {
-		NL_SET_ERR_MSG(f->common.extack,
-			       "Only switchdev port is supported");
-		return -EINVAL;
-	}
-
 	port = netdev_priv(act->dev);
+
 	list_for_each_entry(binding, &block->binding_list, list) {
-		err = prestera_mall_rule_add(binding, port);
+		err = prestera_span_rule_add(binding, port, block->ingress);
 		if (err == -EEXIST)
 			return err;
 		if (err)
@@ -128,12 +106,13 @@ int prestera_mall_replace(struct prestera_flow_block *block,
 
 	prestera_mall_prio_update(block, f);
 
+	block->mall.bound = true;
 	return 0;
 
 rollback:
 	list_for_each_entry_continue_reverse(binding,
 					     &block->binding_list, list)
-		prestera_mall_rule_del(binding);
+		prestera_span_rule_del(binding, block->ingress);
 	return err;
 }
 
@@ -142,8 +121,9 @@ void prestera_mall_destroy(struct prestera_flow_block *block)
 	struct prestera_flow_block_binding *binding;
 
 	list_for_each_entry(binding, &block->binding_list, list)
-		prestera_mall_rule_del(binding);
+		prestera_span_rule_del(binding, block->ingress);
 
-	block->mall_prio = UINT_MAX;
+	block->mall.prio_min = UINT_MAX;
+	block->mall.prio_max = 0;
+	block->mall.bound = false;
 }
-

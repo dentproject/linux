@@ -67,6 +67,7 @@ struct prestera_bridge {
 	 * (Still hold by br_ports). Need to refactor.
 	 */
 	unsigned int ref_count;
+	struct prestera_flood_domain *priv_flood_domain;
 };
 
 struct prestera_bridge_port {
@@ -90,7 +91,10 @@ struct prestera_bridge_vlan {
 struct prestera_swdev_work {
 	struct work_struct work;
 	struct prestera_switch *sw;
-	struct switchdev_notifier_fdb_info fdb_info;
+	union {
+		struct switchdev_notifier_fdb_info fdb_info;
+		struct switchdev_notifier_vxlan_fdb_info vxlan_fdb_info;
+	};
 	struct net_device *dev;
 	unsigned long event;
 };
@@ -138,6 +142,14 @@ static struct prestera_bridge *
 prestera_bridge_get(struct prestera_switch *sw, struct net_device *br_dev);
 static void
 prestera_bridge_put(struct prestera_switch *sw, struct prestera_bridge *bridge);
+static struct prestera_flood_domain *
+prestera_bridge_priv_flood_domain_get(struct prestera_switch *sw,
+				      struct prestera_bridge *bridge);
+static void
+prestera_bridge_priv_flood_domain_destroy(struct prestera_switch *sw,
+					  struct prestera_bridge *bridge);
+static void prestera_bridge_priv_flood_domain_put(struct prestera_switch *sw,
+						  struct prestera_bridge *bridge);
 
 static struct prestera_routed_fdb_entry *
 prestera_routed_fdb_entry_find(const struct prestera_switch *sw,
@@ -249,6 +261,7 @@ prestera_br_port_flags_reset(struct prestera_bridge_port *br_port,
 	prestera_port_uc_flood_set(port, false);
 	prestera_port_mc_flood_set(port, false);
 	prestera_port_learning_set(port, false);
+	prestera_port_br_locked_set(port, false);
 	prestera_port_isolation_grp_set(port, PRESTERA_PORT_SRCID_ZERO);
 }
 
@@ -276,6 +289,11 @@ static int prestera_br_port_flags_set(struct prestera_bridge_port *br_port,
 	iso_srcid = br_port->flags & BR_ISOLATED ?
 			br_dev->isolation_srcid : PRESTERA_PORT_SRCID_ZERO;
 	err = prestera_port_isolation_grp_set(port, iso_srcid);
+	if (err)
+		goto err_out;
+
+	err = prestera_port_br_locked_set(port,
+					  br_port->flags & BR_PORT_LOCKED);
 	if (err)
 		goto err_out;
 
@@ -1058,7 +1076,7 @@ static int prestera_port_obj_attr_set(struct net_device *dev, const void *ctx,
 		break;
 	case SWITCHDEV_ATTR_ID_PORT_PRE_BRIDGE_FLAGS:
 		if (attr->u.brport_flags.mask &
-		    ~(BR_LEARNING | BR_FLOOD | BR_MCAST_FLOOD | BR_ISOLATED))
+		    ~(BR_LEARNING | BR_FLOOD | BR_MCAST_FLOOD | BR_ISOLATED | BR_PORT_LOCKED))
 			err = -EINVAL;
 		break;
 	case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
@@ -1179,8 +1197,8 @@ prestera_port_fdb_local_set(struct prestera_switch *sw,
 			goto out; /* ignore entries with vlan id .1D bridge */
 
 		bridge = prestera_bridge_get(sw, fdb_info->info.dev);
-		if (!bridge)
-			goto out;
+		if (IS_ERR_OR_NULL(bridge))
+			return PTR_ERR(bridge);
 
 		vid = bridge->bridge_id;
 	}
@@ -1290,6 +1308,243 @@ out:
 	dev_put(dev);
 }
 
+static int
+__prestera_vxlan_priv_flood_cfg(struct prestera_switch *sw,
+				struct prestera_l2tun_vp_key *vp_key,
+				struct prestera_bridge *bridge, bool enable)
+{
+	struct prestera_flood_domain_port_key fd_port_key;
+	struct prestera_flood_domain_port *fd_port;
+	struct prestera_flood_domain *fd;
+	int err = 0;
+
+	fd = prestera_bridge_priv_flood_domain_get(sw, bridge);
+	if (!fd)
+		return -ENOMEM;
+
+	/* Configure flooding */
+	memset(&fd_port_key, 0, sizeof(fd_port_key));
+	fd_port_key.type = PRESTERA_FLOOD_DOMAIN_PORT_TYPE_TEP;
+	fd_port_key.tep.vp_key = *vp_key;
+	fd_port = prestera_flood_domain_port_find(fd, &fd_port_key);
+
+	if (enable) {
+		if (WARN_ON(fd_port)) {
+			err = -EINVAL;
+			goto out;
+		}
+
+		err = prestera_flood_domain_port_create(fd, &fd_port_key);
+		if (err)
+			goto out;
+	} else  {
+		if (!fd_port)
+			goto out;
+
+		prestera_flood_domain_port_destroy(fd_port);
+	}
+
+out:
+	prestera_bridge_priv_flood_domain_put(sw, bridge);
+	return err;
+}
+
+/* kTEP configuration: vport + remote_ip.
+ * So vport ready to be pointed from flood_domain/FDB.
+ * Also TT is enabled if this is not multicast remote.
+ */
+static int
+__prestera_vxlan_priv_tep_cfg(struct prestera_switch *sw,
+			      struct prestera_l2tun_vp_key *vp_key,
+			      struct vxlan_dev *vx_dev,
+			      struct prestera_bridge *bridge,
+			      struct prestera_ip_addr ip, bool enable)
+{
+	struct prestera_nexthop_group_key nh_grp_key;
+	struct prestera_l2tun_tep_key tep_key;
+	struct prestera_l2tun_tep_cfg tep_cfg;
+	struct prestera_l2tun_tt_key tt_key;
+	struct prestera_l2tun_tep *tep;
+	struct prestera_l2tun_tt *tt;
+	u32 source_id;
+	int nhs;
+
+	if (ip.v != PRESTERA_IPV4)
+		return -EINVAL; /* TODO */
+
+	/* TODO: sourceId */
+
+	memset(&tep_key, 0, sizeof(tep_key));
+	tep_key.vp_key = *vp_key;
+
+	memset(&tt_key, 0, sizeof(tt_key));
+	tt_key.ip.v = PRESTERA_IPV4;
+	tt_key.ip.u.ipv4 = vx_dev->cfg.saddr.sin.sin_addr.s_addr;
+	tt_key.match_src_ip = true;
+	tt_key.src_ip = ip;
+	tt_key.port = __be16_to_cpu(vx_dev->cfg.dst_port);
+	tt_key.vni = __be32_to_cpu(vx_dev->cfg.vni);
+
+	tep = prestera_l2tun_tep_find(sw, &tep_key);
+	tt = prestera_l2tun_tt_find(sw, &tt_key);
+
+	if (enable) {
+		if (tep) {
+			refcount_inc(&tep->ext.refcount);
+			/* NOTE: for now we use single TT per TEP cfg.
+			 * So if we found TEP cfg - TT existed too.
+			 * Keep it in sync, or change logic.
+			 */
+			return 0;
+		}
+
+		/* TMP: Pseudo rand isolation id.
+		 * We has only 16 per vlan
+		 */
+		source_id = (uintptr_t)vx_dev;
+		source_id ^= source_id >> 16;
+		source_id ^= source_id >> 8;
+		source_id ^= source_id >> 4;
+		source_id &= 0xf;
+
+		nhs = prestera_util_kern_dip2nh_grp_key(sw, RT_TABLE_MAIN,
+							&ip, &nh_grp_key);
+		if (nhs < 1)
+			return -EINVAL;
+
+		memset(&tep_cfg, 0, sizeof(tep_cfg));
+		tep_cfg.dip = ip;
+		tep_cfg.sip.v = PRESTERA_IPV4;
+		tep_cfg.sip.u.ipv4 = vx_dev->cfg.saddr.sin.sin_addr.s_addr;
+		tep_cfg.l4_dst = __be16_to_cpu(vx_dev->cfg.dst_port);
+		tep_cfg.vni = __be32_to_cpu(vx_dev->cfg.vni);
+		tep_cfg.source_id = source_id;
+
+		tep = prestera_l2tun_tep_create(sw, &tep_key, &tep_cfg,
+						&nh_grp_key.neigh[0]);
+		if (!tep)
+			return -EINVAL;
+
+		refcount_set(&tep->ext.refcount, 1);
+
+		if (ipv4_is_multicast(ip.u.ipv4))
+			return 0;
+			/* We don't need MC TT.
+			 * Bcs It will break learning.
+			 */
+
+		if (WARN_ON(tt)) /* Should be in sync with TEP */
+			return -EINVAL;
+
+		tt = prestera_l2tun_tt_create(sw, &tt_key, bridge->bridge_id,
+					      vp_key, source_id);
+		/* Can we stil operate, even if tt failed ? */
+		if (!tt) {
+			pr_err("TT is not configured for %pI4n", &ip.u.ipv4);
+			return 0;
+		}
+	} else {
+		if (!tep)
+			return 0;
+
+		if (!refcount_dec_and_test(&tep->ext.refcount))
+			return 0;
+
+		prestera_l2tun_tep_destroy(sw, tep);
+
+		if (!tt)
+			return 0;
+
+		prestera_l2tun_tt_destroy(sw, tt);
+	}
+
+	return 0;
+}
+
+static int
+__prestera_vxlan_fdb_event(struct prestera_switch *sw, struct vxlan_dev *vx_dev,
+			   struct switchdev_notifier_vxlan_fdb_info *info,
+			   bool enable)
+{
+	struct prestera_bridge_port *br_port;
+	struct prestera_l2tun_vp_key vp_key;
+	struct prestera_ip_addr pr_dip;
+	int err = 0;
+
+	/* TODO: hold only when TEP configured. Otherwise - find */
+	br_port = prestera_bridge_port_get(sw, vx_dev->dev);
+	if (IS_ERR_OR_NULL(br_port))
+		return -EINVAL;
+
+	/* TODO: also support pvid */
+	if (br_port->bridge->vlan_enabled) {
+		err = -EINVAL;
+		goto err_out;
+	}
+
+	memset(&pr_dip, 0, sizeof(pr_dip));
+	pr_dip.v = PRESTERA_IPV4;
+	pr_dip.u.ipv4 = info->remote_ip.sin.sin_addr.s_addr;
+
+	memset(&vp_key, 0, sizeof(vp_key));
+	vp_key.id = vx_dev;
+	vp_key.ip = pr_dip;
+
+	/* Configure TS+TT (Multiple per TEP) */
+	/* TODO: same vx_dev, different bridges (vlans) */
+	err = __prestera_vxlan_priv_tep_cfg(sw, &vp_key, vx_dev,
+					    br_port->bridge, pr_dip, enable);
+	if (err)
+		goto err_out;
+
+	if (is_zero_ether_addr(&info->eth_addr[0])) {
+		/* Configure flooding (Once per TEP) */
+		err = __prestera_vxlan_priv_flood_cfg(sw, &vp_key,
+						      br_port->bridge, enable);
+		if (err)
+			goto err_out;
+	} else {
+		/* TODO: check bridge driver's FDB table */
+		/* TODO: call from bridge FDB table */
+
+		/* Configure FDB entry (Multiple per TEP) */
+
+		err = prestera_l2tun_vp_util_fdb_set(sw, &vp_key,
+						     &info->eth_addr[0],
+						     br_port->bridge->bridge_id,
+						     enable, false);
+		if (err)
+			goto err_out;
+	}
+
+	info->offloaded = true;
+err_out:
+	prestera_bridge_port_put(sw, br_port);
+	return err;
+}
+
+static void prestera_vxlan_fdb_event_work(struct work_struct *work)
+{
+	struct prestera_swdev_work *swdev_work =
+	    container_of(work, struct prestera_swdev_work, work);
+	int err;
+
+	rtnl_lock();
+
+	err = __prestera_vxlan_fdb_event(swdev_work->sw,
+					 netdev_priv(swdev_work->dev),
+					 &swdev_work->vxlan_fdb_info,
+					 swdev_work->event ==
+					 SWITCHDEV_VXLAN_FDB_ADD_TO_DEVICE ?
+					 true : false);
+	if (err)
+		netdev_err(swdev_work->dev, "VXLAN fdb entry adding failed\n");
+
+/* out: */
+	rtnl_unlock();
+	dev_put(swdev_work->dev);
+	kfree(swdev_work);
+}
 static int prestera_switchdev_event(struct notifier_block *nb,
 				    unsigned long event, void *ptr)
 {
@@ -1297,6 +1552,7 @@ static int prestera_switchdev_event(struct notifier_block *nb,
 	struct net_device *net_dev = switchdev_notifier_info_to_dev(ptr);
 	struct prestera_swdev_work *swdev_work;
 	struct switchdev_notifier_fdb_info *fdb_info;
+	struct switchdev_notifier_vxlan_fdb_info *vxlan_fdb_info;
 	struct switchdev_notifier_info *info = ptr;
 	struct prestera_switchdev *swdev;
 
@@ -1338,6 +1594,21 @@ static int prestera_switchdev_event(struct notifier_block *nb,
 		break;
 	case SWITCHDEV_VXLAN_FDB_ADD_TO_DEVICE:
 	case SWITCHDEV_VXLAN_FDB_DEL_TO_DEVICE:
+		if (!netif_is_vxlan(net_dev)) {
+			kfree(swdev_work);
+			return NOTIFY_DONE;
+		}
+
+		vxlan_fdb_info =
+			container_of(info,
+				     struct switchdev_notifier_vxlan_fdb_info,
+				     info);
+		INIT_WORK(&swdev_work->work, prestera_vxlan_fdb_event_work);
+		memcpy(&swdev_work->vxlan_fdb_info, vxlan_fdb_info,
+		       sizeof(*vxlan_fdb_info));
+		dev_hold(net_dev);
+
+		break;
 	default:
 		kfree(swdev_work);
 		return NOTIFY_DONE;
@@ -1350,16 +1621,64 @@ out:
 	return NOTIFY_BAD;
 }
 
-static int prestera_switchdev_blocking_event(struct notifier_block *unused,
+/* Use this handler instead of switchdev_handle_port_obj_add, because
+ * vxlan port will be rejected by prestera_netdev_check
+ */
+static int
+__prestera_switchdev_vxlan_obj_event(struct prestera_switch *sw,
+				     struct switchdev_notifier_port_obj_info *
+				     port_obj_info,
+				     bool add)
+{
+	struct switchdev_obj_port_vlan *vlan_obj;
+	struct prestera_bridge_port *br_port;
+	struct net_device *dev;
+	int err = 0;
+
+	/* rtnl taken ! */
+
+	if (port_obj_info->obj->id != SWITCHDEV_OBJ_ID_PORT_VLAN)
+		goto out;
+
+	dev = port_obj_info->info.dev;
+	vlan_obj = container_of(port_obj_info->obj,
+				struct switchdev_obj_port_vlan, obj);
+	/* For now add only pvid. As it described in RFC7348 */
+	if (!(vlan_obj->flags & BRIDGE_VLAN_INFO_UNTAGGED) ||
+	    !(vlan_obj->flags & BRIDGE_VLAN_INFO_PVID))
+		goto out;
+
+	br_port = add ? prestera_bridge_port_get(sw, dev) :
+			prestera_bridge_port_find(sw, dev);
+
+	if (IS_ERR_OR_NULL(br_port)) {
+		if (add)
+			err = -EINVAL;
+
+		goto out;
+	}
+
+	if (!add)
+		prestera_bridge_port_put(sw, br_port);
+
+out:
+	port_obj_info->handled = true;
+	return err;
+}
+
+static int prestera_switchdev_blocking_event(struct notifier_block *nb,
 					     unsigned long event, void *ptr)
 {
 	int err = 0;
 	struct net_device *net_dev = switchdev_notifier_info_to_dev(ptr);
+	struct prestera_switchdev *swdev =
+		container_of(nb, struct prestera_switchdev, swdev_blocking_n);
 
 	switch (event) {
 	case SWITCHDEV_PORT_OBJ_ADD:
 		if (netif_is_vxlan(net_dev)) {
-			err = -EOPNOTSUPP;
+			err = __prestera_switchdev_vxlan_obj_event(swdev->sw,
+								   ptr, true);
 		} else {
 			err = switchdev_handle_port_obj_add
 			    (net_dev, ptr, prestera_netdev_check,
@@ -1368,7 +1687,8 @@ static int prestera_switchdev_blocking_event(struct notifier_block *unused,
 		break;
 	case SWITCHDEV_PORT_OBJ_DEL:
 		if (netif_is_vxlan(net_dev)) {
-			err = -EOPNOTSUPP;
+			err = __prestera_switchdev_vxlan_obj_event(swdev->sw,
+								   ptr, false);
 		} else {
 			err = switchdev_handle_port_obj_del
 			    (net_dev, ptr, prestera_netdev_check,
@@ -1433,6 +1753,8 @@ static void
 prestera_bridge_destroy(struct prestera_switch *sw,
 			struct prestera_bridge *bridge)
 {
+	prestera_bridge_priv_flood_domain_destroy(sw, bridge);
+
 	list_del(&bridge->bridge_node);
 	if (bridge->vlan_enabled)
 		sw->swdev->bridge_8021q_exists = false;
@@ -1461,6 +1783,90 @@ prestera_bridge_put(struct prestera_switch *sw, struct prestera_bridge *bridge)
 {
 	if (list_empty(&bridge->port_list) && !bridge->ref_count)
 		prestera_bridge_destroy(sw, bridge);
+}
+
+static struct prestera_flood_domain *
+prestera_bridge_priv_flood_domain_get(struct prestera_switch *sw,
+				      struct prestera_bridge *bridge)
+{
+	struct prestera_flood_domain_port_key fd_port_key;
+	struct prestera_flood_domain_port *fd_port;
+	int err;
+
+	if (bridge->vlan_enabled)
+		return NULL;
+
+	if (bridge->priv_flood_domain)
+		goto out;
+
+	bridge->priv_flood_domain = prestera_flood_domain_create(sw);
+	if (!bridge->priv_flood_domain)
+		goto err_fd_create;
+
+	/* Set default flooding entry */
+	memset(&fd_port_key, 0, sizeof(fd_port_key));
+	fd_port_key.type = PRESTERA_FLOOD_DOMAIN_PORT_TYPE_VLAN;
+	err = prestera_flood_domain_port_create(bridge->priv_flood_domain,
+						&fd_port_key);
+	if (err)
+		goto err_def_entry;
+
+	err = prestera_hw_vlan_flood_domain_set(sw, bridge->bridge_id,
+						bridge->priv_flood_domain->idx);
+	if (err)
+		goto err_hw_vlan_set;
+
+out:
+	return bridge->priv_flood_domain;
+
+err_hw_vlan_set:
+	fd_port = list_first_entry(&bridge->priv_flood_domain->flood_domain_port_list,
+				   struct prestera_flood_domain_port,
+				   flood_domain_port_node);
+	prestera_flood_domain_port_destroy(fd_port);
+err_def_entry:
+	prestera_flood_domain_destroy(bridge->priv_flood_domain);
+	bridge->priv_flood_domain = NULL;
+err_fd_create:
+	return NULL;
+}
+
+static void prestera_bridge_priv_flood_domain_destroy(struct prestera_switch *sw,
+						      struct prestera_bridge *bridge)
+{
+	struct prestera_flood_domain_port *flood_domain_port, *tmp;
+	struct prestera_flood_domain *fd;
+
+	if (bridge->vlan_enabled)
+		return;
+
+	fd = bridge->priv_flood_domain;
+	if (!fd)
+		return;
+
+	list_for_each_entry_safe(flood_domain_port, tmp,
+				 &fd->flood_domain_port_list,
+				 flood_domain_port_node) {
+		prestera_flood_domain_port_destroy(flood_domain_port);
+	}
+
+	prestera_flood_domain_destroy(bridge->priv_flood_domain);
+	bridge->priv_flood_domain = NULL;
+}
+
+static void prestera_bridge_priv_flood_domain_put(struct prestera_switch *sw,
+						  struct prestera_bridge *bridge)
+{
+	if (bridge->vlan_enabled)
+		return;
+
+	if (!bridge->priv_flood_domain)
+		return;
+
+	if (!list_is_singular(&bridge->priv_flood_domain->flood_domain_port_list))
+		return;
+
+	prestera_bridge_priv_flood_domain_destroy(sw, bridge);
 }
 
 static struct prestera_bridge_port *
@@ -1502,9 +1908,9 @@ prestera_bridge_port_destroy(struct prestera_bridge_port *br_port)
 static struct prestera_bridge_port *
 prestera_bridge_port_get(struct prestera_switch *sw, struct net_device *dev)
 {
-	struct net_device *br_dev = netdev_master_upper_dev_get(dev);
-	struct prestera_bridge *bridge;
 	struct prestera_bridge_port *br_port;
+	struct prestera_bridge *bridge;
+	struct net_device *br_dev;
 	int err;
 
 	br_port = prestera_bridge_port_find(sw, dev);
@@ -1513,8 +1919,12 @@ prestera_bridge_port_get(struct prestera_switch *sw, struct net_device *dev)
 		return br_port;
 	}
 
+	br_dev = netdev_master_upper_dev_get(dev);
+	if (!br_dev)
+		return NULL;
+
 	bridge = prestera_bridge_get(sw, br_dev);
-	if (IS_ERR(bridge))
+	if (IS_ERR_OR_NULL(bridge))
 		return ERR_CAST(bridge);
 
 	br_port = prestera_bridge_port_create(bridge, dev);
@@ -1605,7 +2015,7 @@ int prestera_port_bridge_join(struct prestera_port *port,
 	int err;
 
 	br_port = prestera_bridge_port_get(sw, brport_dev);
-	if (IS_ERR(br_port))
+	if (IS_ERR_OR_NULL(br_port))
 		return PTR_ERR(br_port);
 
 	bridge = br_port->bridge;
@@ -1832,12 +2242,16 @@ prestera_mdb_port_add(struct prestera_mdb_entry *mdb,
 		      const unsigned char addr[ETH_ALEN], u16 vid)
 {
 	struct prestera_flood_domain *flood_domain = mdb->flood_domain;
+	struct prestera_flood_domain_port_key fd_key;
 	int err;
 
-	if (!prestera_flood_domain_port_find(flood_domain,
-					     orig_dev, vid)) {
-		err = prestera_flood_domain_port_create(flood_domain, orig_dev,
-							vid);
+	memset(&fd_key, 0, sizeof(fd_key));
+	fd_key.type = PRESTERA_FLOOD_DOMAIN_PORT_TYPE_DEV;
+	fd_key.dev_port.dev = orig_dev;
+	fd_key.dev_port.vid = vid;
+
+	if (!prestera_flood_domain_port_find(flood_domain, &fd_key)) {
+		err = prestera_flood_domain_port_create(flood_domain, &fd_key);
 		if (err)
 			return err;
 	}
@@ -1851,10 +2265,14 @@ prestera_mdb_port_del(struct prestera_mdb_entry *mdb,
 {
 	struct prestera_flood_domain *fl_domain = mdb->flood_domain;
 	struct prestera_flood_domain_port *flood_domain_port;
+	struct prestera_flood_domain_port_key fd_key;
 
-	flood_domain_port = prestera_flood_domain_port_find(fl_domain,
-							    orig_dev,
-							    mdb->vid);
+	memset(&fd_key, 0, sizeof(fd_key));
+	fd_key.type = PRESTERA_FLOOD_DOMAIN_PORT_TYPE_DEV;
+	fd_key.dev_port.dev = orig_dev;
+	fd_key.dev_port.vid = mdb->vid;
+
+	flood_domain_port = prestera_flood_domain_port_find(fl_domain, &fd_key);
 	if (flood_domain_port)
 		prestera_flood_domain_port_destroy(flood_domain_port);
 }
@@ -1879,8 +2297,8 @@ prestera_mdb_flush_bridge_port(struct prestera_bridge_port *br_port)
 			prestera_mdb_port_del(br_mdb->mdb,
 					      br_mdb_port->br_port->dev);
 			prestera_br_mdb_port_del(br_mdb,  br_mdb_port->br_port);
-			prestera_br_mdb_entry_put(br_mdb);
 		}
+		prestera_br_mdb_entry_put(br_mdb);
 	}
 }
 

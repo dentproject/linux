@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause OR GPL-2.0
 /* Copyright (c) 2019-2021 Marvell International Ltd. All rights reserved */
 
+#include <linux/bitfield.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -15,15 +16,16 @@
 #include "prestera_rxtx.h"
 #include "prestera_devlink.h"
 
-#define MVSW_DSA_TAG_ARP_BROADCAST 5
-#define MVSW_DSA_TAG_IPV4_BROADCAST 19
-#define MVSW_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC 16
-#define MVSW_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC_1 29
-#define MVSW_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC_2 30
-#define MVSW_DSA_TAG_UDP_BROADCAST 33
-#define MVSW_DSA_TAG_ARP_BROADCAST_TO_ME 179
+#define PRESTERA_DSA_TAG_ARP_BROADCAST 5
+#define PRESTERA_DSA_TAG_IPV6_NEIGHBOR_SOLICITATION 18
+#define PRESTERA_DSA_TAG_IPV4_BROADCAST 19
+#define PRESTERA_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC 16
+#define PRESTERA_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC_1 29
+#define PRESTERA_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC_2 30
+#define PRESTERA_DSA_TAG_UDP_BROADCAST 33
+#define PRESTERA_DSA_TAG_ARP_BROADCAST_TO_ME 179
 
-struct mvsw_sdma_desc {
+struct prestera_sdma_desc {
 	__le32 word1;
 	__le32 word2;
 	__le32 buff;
@@ -40,6 +42,9 @@ struct mvsw_sdma_desc {
 
 #define SDMA_RX_DESC_CPU_OWN	0
 #define SDMA_RX_DESC_DMA_OWN	1
+
+#define SDMA_RX_DESC_LAST	BIT(26)
+#define SDMA_RX_DESC_FIRST	BIT(27)
 
 #define SDMA_RX_QUEUE_NUM	8
 
@@ -62,43 +67,41 @@ struct mvsw_sdma_desc {
 #define SDMA_TX_DESC_SINGLE	(SDMA_TX_DESC_FIRST | SDMA_TX_DESC_LAST)
 #define SDMA_TX_DESC_CALC_CRC	BIT(12)
 
-#define mvsw_reg_write(sw, reg, val) \
-	writel(val, (sw)->dev->pp_regs + (reg))
-#define mvsw_reg_read(sw, reg) \
-	readl((sw)->dev->pp_regs + (reg))
-
 #define SDMA_RX_INTR_MASK_REG		0x2814
-#define SDMA_RX_QUEUE_STATUS_REG	0x2680
+#define SDMA_RX_QUEUE_CMD_REG		0x2680
+#define SDMA_RX_INTR_CAUSE_REG		0x280C
 #define SDMA_RX_QUEUE_DESC_REG(n)	(0x260C + (n) * 16)
+
+#define SDMA_RX_QUEUE_ERR_STATUS_MASK	GENMASK(18, 11)
 
 #define SDMA_TX_QUEUE_DESC_REG		0x26C0
 #define SDMA_TX_QUEUE_START_REG		0x2868
 
-struct mvsw_sdma_buf {
-	struct mvsw_sdma_desc *desc;
+struct prestera_sdma_buf {
+	struct prestera_sdma_desc *desc;
 	dma_addr_t desc_dma;
 	struct sk_buff *skb;
 	dma_addr_t buf_dma;
 	bool is_used;
 };
 
-struct mvsw_sdma_rx_ring {
-	struct mvsw_sdma_buf *bufs;
+struct prestera_sdma_rx_ring {
+	struct prestera_sdma_buf *bufs;
 	int next_rx;
 	int weight;
 	int recvd;
 };
 
-struct mvsw_sdma_tx_ring {
-	struct mvsw_sdma_buf *bufs;
+struct prestera_sdma_tx_ring {
+	struct prestera_sdma_buf *bufs;
 	int next_tx;
 	int max_burst;
 	int burst;
 };
 
-struct mvsw_pr_rxtx_sdma {
-	struct mvsw_sdma_rx_ring rx_ring[SDMA_RX_QUEUE_NUM];
-	struct mvsw_sdma_tx_ring tx_ring;
+struct prestera_rxtx_sdma {
+	struct prestera_sdma_rx_ring rx_ring[SDMA_RX_QUEUE_NUM];
+	struct prestera_sdma_tx_ring tx_ring;
 	const struct prestera_switch *sw;
 	struct dma_pool *desc_pool;
 	struct work_struct tx_work;
@@ -113,7 +116,7 @@ struct mvsw_pr_rxtx_sdma {
 };
 
 struct prestera_rxtx {
-	struct mvsw_pr_rxtx_sdma sdma;
+	struct prestera_rxtx_sdma sdma;
 };
 
 static int prestera_rx_weight_map[SDMA_RX_QUEUE_NUM] = {
@@ -122,18 +125,18 @@ static int prestera_rx_weight_map[SDMA_RX_QUEUE_NUM] = {
 
 static u64 *cpu_code_stats;
 
-static int mvsw_sdma_buf_desc_alloc(struct mvsw_pr_rxtx_sdma *sdma,
-				    struct mvsw_sdma_buf *buf)
+static int prestera_sdma_buf_desc_alloc(struct prestera_rxtx_sdma *sdma,
+					struct prestera_sdma_buf *buf)
 {
 	struct device *dma_dev = sdma->sw->dev->dev;
-	struct mvsw_sdma_desc *desc;
+	struct prestera_sdma_desc *desc;
 	dma_addr_t dma;
 
 	desc = dma_pool_alloc(sdma->desc_pool, sdma->dma_flags | GFP_KERNEL, &dma);
 	if (!desc)
 		return -ENOMEM;
 
-	if (dma + sizeof(struct mvsw_sdma_desc) > sdma->dma_mask) {
+	if (dma + sizeof(struct prestera_sdma_desc) > sdma->dma_mask) {
 		dev_err(dma_dev, "failed to alloc desc\n");
 		dma_pool_free(sdma->desc_pool, desc, dma);
 		return -ENOMEM;
@@ -145,12 +148,32 @@ static int mvsw_sdma_buf_desc_alloc(struct mvsw_pr_rxtx_sdma *sdma,
 	return 0;
 }
 
-static u32 mvsw_sdma_addr_phy(struct mvsw_pr_rxtx_sdma *sdma, dma_addr_t pa)
+static u32 prestera_sdma_addr_phy(struct prestera_rxtx_sdma *sdma, dma_addr_t pa)
 {
 	return sdma->map_addr + pa;
 }
 
-static void mvsw_sdma_rx_desc_set_len(struct mvsw_sdma_desc *desc, size_t val)
+static bool prestera_sdma_rx_desc_is_first(struct prestera_sdma_desc *desc)
+{
+	u32 word = le32_to_cpu(desc->word1);
+
+	return word & SDMA_RX_DESC_FIRST;
+}
+
+static bool prestera_sdma_rx_desc_is_last(struct prestera_sdma_desc *desc)
+{
+	u32 word = le32_to_cpu(desc->word1);
+
+	return word & SDMA_RX_DESC_LAST;
+}
+
+static bool prestera_sdma_rx_desc_is_single(struct prestera_sdma_desc *desc)
+{
+	return prestera_sdma_rx_desc_is_first(desc) &&
+		prestera_sdma_rx_desc_is_last(desc);
+}
+
+static void prestera_sdma_rx_desc_set_len(struct prestera_sdma_desc *desc, size_t val)
 {
 	u32 word = le32_to_cpu(desc->word2);
 
@@ -158,26 +181,26 @@ static void mvsw_sdma_rx_desc_set_len(struct mvsw_sdma_desc *desc, size_t val)
 	desc->word2 = cpu_to_le32(word);
 }
 
-static void mvsw_sdma_rx_desc_init(struct mvsw_pr_rxtx_sdma *sdma,
-				   struct mvsw_sdma_desc *desc,
-				   dma_addr_t buf)
+static void prestera_sdma_rx_desc_init(struct prestera_rxtx_sdma *sdma,
+				       struct prestera_sdma_desc *desc,
+				       dma_addr_t buf)
 {
-	mvsw_sdma_rx_desc_set_len(desc, SDMA_BUFF_SIZE_MAX);
-	desc->buff = cpu_to_le32(mvsw_sdma_addr_phy(sdma, buf));
+	prestera_sdma_rx_desc_set_len(desc, SDMA_BUFF_SIZE_MAX);
+	desc->buff = cpu_to_le32(prestera_sdma_addr_phy(sdma, buf));
 	/* make sure buffer is set before reset the descriptor */
 	wmb();
 	desc->word1 = cpu_to_le32(0xA0000000);
 }
 
-static void mvsw_sdma_rx_desc_set_next(struct mvsw_pr_rxtx_sdma *sdma,
-				       struct mvsw_sdma_desc *desc,
-				       dma_addr_t next)
+static void prestera_sdma_rx_desc_set_next(struct prestera_rxtx_sdma *sdma,
+					   struct prestera_sdma_desc *desc,
+					   dma_addr_t next)
 {
-	desc->next = cpu_to_le32(mvsw_sdma_addr_phy(sdma, next));
+	desc->next = cpu_to_le32(prestera_sdma_addr_phy(sdma, next));
 }
 
-static int mvsw_sdma_rx_dma_alloc(struct mvsw_pr_rxtx_sdma *sdma,
-				  struct mvsw_sdma_buf *buf)
+static int prestera_sdma_rx_dma_alloc(struct prestera_rxtx_sdma *sdma,
+				      struct prestera_sdma_buf *buf)
 {
 	struct device *dev = sdma->sw->dev->dev;
 
@@ -206,15 +229,15 @@ err_dma_map:
 	return -ENOMEM;
 }
 
-static struct sk_buff *mvsw_sdma_rx_buf_get(struct mvsw_pr_rxtx_sdma *sdma,
-					    struct mvsw_sdma_buf *buf)
+static struct sk_buff *prestera_sdma_rx_buf_get(struct prestera_rxtx_sdma *sdma,
+						struct prestera_sdma_buf *buf)
 {
 	struct sk_buff *skb_orig = buf->skb;
 	dma_addr_t buf_dma = buf->buf_dma;
 	u32 len = skb_orig->len;
 	int err;
 
-	err = mvsw_sdma_rx_dma_alloc(sdma, buf);
+	err = prestera_sdma_rx_dma_alloc(sdma, buf);
 	if (err) {
 		struct sk_buff *skb;
 
@@ -232,29 +255,29 @@ static struct sk_buff *mvsw_sdma_rx_buf_get(struct mvsw_pr_rxtx_sdma *sdma,
 	return skb_orig;
 }
 
-static void mvsw_sdma_rx_set_next_queue(struct mvsw_pr_rxtx_sdma *sdma, int rxq)
+static void prestera_sdma_rx_set_next_queue(struct prestera_rxtx_sdma *sdma, int rxq)
 {
 	sdma->next_rxq = rxq % SDMA_RX_QUEUE_NUM;
 }
 
-static int mvsw_sdma_rx_pick_next_queue(struct mvsw_pr_rxtx_sdma *sdma)
+static int prestera_sdma_rx_pick_next_queue(struct prestera_rxtx_sdma *sdma)
 {
-	struct mvsw_sdma_rx_ring *ring = &sdma->rx_ring[sdma->next_rxq];
+	struct prestera_sdma_rx_ring *ring = &sdma->rx_ring[sdma->next_rxq];
 
 	if (ring->recvd >= ring->weight) {
-		mvsw_sdma_rx_set_next_queue(sdma, sdma->next_rxq + 1);
+		prestera_sdma_rx_set_next_queue(sdma, sdma->next_rxq + 1);
 		ring->recvd = 0;
 	}
 
 	return sdma->next_rxq;
 }
 
-static int mvsw_pr_sdma_recv_skb(struct sk_buff *skb)
+static int prestera_sdma_recv_skb(struct sk_buff *skb)
 {
 	struct prestera_rxtx_stats *rxtx_stats;
 	struct prestera_port *port;
-	struct mvsw_pr_dsa dsa;
-	u32 hw_port, hw_id;
+	struct prestera_dsa dsa;
+	u32 hw_port, hw_id, dsa_len;
 	u8 cpu_code;
 	int err;
 
@@ -263,7 +286,7 @@ static int mvsw_pr_sdma_recv_skb(struct sk_buff *skb)
 	/* parse/process DSA tag
 	 * ethertype field is part of the dsa header
 	 */
-	err = mvsw_pr_dsa_parse(skb->data - ETH_TLEN, &dsa);
+	err = prestera_dsa_parse(skb->data - ETH_TLEN, &dsa);
 	if (err)
 		return err;
 
@@ -276,14 +299,16 @@ static int mvsw_pr_sdma_recv_skb(struct sk_buff *skb)
 				    hw_id, hw_port);
 		return -EEXIST;
 	}
+	dsa_len = (dsa.dsa_type == PRESTERA_DSA_TYPE_EDSA16) ?
+		  PRESTERA_DSA_HLEN : PRESTERA_DSA_AC5_HLEN;
 
-	if (unlikely(!pskb_may_pull(skb, MVSW_PR_DSA_HLEN)))
+	if (unlikely(!pskb_may_pull(skb, dsa_len)))
 		return -EINVAL;
 
 	/* remove DSA tag and update checksum */
-	skb_pull_rcsum(skb, MVSW_PR_DSA_HLEN);
+	skb_pull_rcsum(skb, dsa_len);
 
-	memmove(skb->data - ETH_HLEN, skb->data - ETH_HLEN - MVSW_PR_DSA_HLEN,
+	memmove(skb->data - ETH_HLEN, skb->data - ETH_HLEN - dsa_len,
 		ETH_ALEN * 2);
 
 	skb_push(skb, ETH_HLEN);
@@ -305,13 +330,14 @@ static int mvsw_pr_sdma_recv_skb(struct sk_buff *skb)
 	prestera_devlink_trap_report(port, skb, cpu_code);
 
 	switch (cpu_code) {
-	case MVSW_DSA_TAG_ARP_BROADCAST:
-	case MVSW_DSA_TAG_IPV4_BROADCAST:
-	case MVSW_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC:
-	case MVSW_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC_1:
-	case MVSW_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC_2:
-	case MVSW_DSA_TAG_UDP_BROADCAST:
-	case MVSW_DSA_TAG_ARP_BROADCAST_TO_ME:
+	case PRESTERA_DSA_TAG_ARP_BROADCAST:
+	case PRESTERA_DSA_TAG_IPV4_BROADCAST:
+	case PRESTERA_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC:
+	case PRESTERA_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC_1:
+	case PRESTERA_DSA_TAG_IPV4_IPV6_LINK_LOCAL_MC_2:
+	case PRESTERA_DSA_TAG_UDP_BROADCAST:
+	case PRESTERA_DSA_TAG_ARP_BROADCAST_TO_ME:
+	case PRESTERA_DSA_TAG_IPV6_NEIGHBOR_SOLICITATION:
 		skb->offload_fwd_mark = 1;
 	}
 	++cpu_code_stats[cpu_code];
@@ -325,27 +351,27 @@ static int mvsw_pr_sdma_recv_skb(struct sk_buff *skb)
 	return 0;
 }
 
-static int mvsw_sdma_rx_poll(struct napi_struct *napi, int budget)
+static int prestera_sdma_rx_poll(struct napi_struct *napi, int budget)
 {
 	unsigned int qmask = GENMASK(SDMA_RX_QUEUE_NUM - 1, 0);
-	struct mvsw_pr_rxtx_sdma *sdma;
+	struct prestera_rxtx_sdma *sdma;
 	unsigned int rxq_done_map = 0;
 	struct list_head rx_list;
 	int pkts_done = 0;
 
 	INIT_LIST_HEAD(&rx_list);
 
-	sdma = container_of(napi, struct mvsw_pr_rxtx_sdma, rx_napi);
+	sdma = container_of(napi, struct prestera_rxtx_sdma, rx_napi);
 
 	while (pkts_done < budget && rxq_done_map != qmask) {
-		struct mvsw_sdma_rx_ring *ring;
-		struct mvsw_sdma_desc *desc;
-		struct mvsw_sdma_buf *buf;
+		struct prestera_sdma_rx_ring *ring;
+		struct prestera_sdma_desc *desc;
+		struct prestera_sdma_buf *buf;
 		struct sk_buff *skb;
 		int buf_idx;
 		int rxq;
 
-		rxq = mvsw_sdma_rx_pick_next_queue(sdma);
+		rxq = prestera_sdma_rx_pick_next_queue(sdma);
 		ring = &sdma->rx_ring[rxq];
 
 		buf_idx = ring->next_rx;
@@ -353,10 +379,13 @@ static int mvsw_sdma_rx_poll(struct napi_struct *napi, int budget)
 		desc = buf->desc;
 
 		if (SDMA_RX_DESC_OWNER(desc) != SDMA_RX_DESC_CPU_OWN) {
-			mvsw_sdma_rx_set_next_queue(sdma, rxq + 1);
+			prestera_sdma_rx_set_next_queue(sdma, rxq + 1);
 			rxq_done_map |= BIT(rxq);
 			continue;
 		} else {
+			/* skip a jumbo frames for a while ... */
+			if (!prestera_sdma_rx_desc_is_single(desc))
+				goto rx_reset_buf;
 			rxq_done_map &= ~BIT(rxq);
 		}
 
@@ -365,43 +394,45 @@ static int mvsw_sdma_rx_poll(struct napi_struct *napi, int budget)
 
 		__skb_trim(buf->skb, SDMA_RX_DESC_PKT_LEN(desc));
 
-		skb = mvsw_sdma_rx_buf_get(sdma, buf);
+		skb = prestera_sdma_rx_buf_get(sdma, buf);
 		if (!skb)
 			goto rx_reset_buf;
 
-		if (unlikely(mvsw_pr_sdma_recv_skb(skb)))
+		if (unlikely(prestera_sdma_recv_skb(skb)))
 			goto rx_reset_buf;
 
 		list_add_tail(&skb->list, &rx_list);
 rx_reset_buf:
-		mvsw_sdma_rx_desc_init(sdma, buf->desc, buf->buf_dma);
+		prestera_sdma_rx_desc_init(sdma, buf->desc, buf->buf_dma);
 		ring->next_rx = (buf_idx + 1) % SDMA_RX_DESC_PER_Q;
 	}
 
 	if (pkts_done < budget && napi_complete_done(napi, pkts_done))
-		mvsw_reg_write(sdma->sw, SDMA_RX_INTR_MASK_REG,
-			       (0xff << 2) | (0xff << 11));
+		prestera_reg_write(sdma->sw, SDMA_RX_INTR_MASK_REG,
+				   (0xff << 2) | (0xff << 11));
 
 	netif_receive_skb_list(&rx_list);
 
 	return pkts_done;
 }
 
-static void mvsw_sdma_rx_fini(struct mvsw_pr_rxtx_sdma *sdma)
+static void prestera_sdma_rx_fini(struct prestera_rxtx_sdma *sdma)
 {
 	int q, b;
 
+	prestera_reg_write(sdma->sw, SDMA_RX_INTR_MASK_REG, 0);
+
 	/* disable all rx queues */
-	mvsw_reg_write(sdma->sw, SDMA_RX_QUEUE_STATUS_REG, 0xff00);
+	prestera_reg_write(sdma->sw, SDMA_RX_QUEUE_CMD_REG, 0xff00);
 
 	for (q = 0; q < SDMA_RX_QUEUE_NUM; q++) {
-		struct mvsw_sdma_rx_ring *ring = &sdma->rx_ring[q];
+		struct prestera_sdma_rx_ring *ring = &sdma->rx_ring[q];
 
 		if (!ring->bufs)
 			break;
 
 		for (b = 0; b < SDMA_RX_DESC_PER_Q; b++) {
-			struct mvsw_sdma_buf *buf = &ring->bufs[b];
+			struct prestera_sdma_buf *buf = &ring->bufs[b];
 
 			if (buf->desc_dma)
 				dma_pool_free(sdma->desc_pool, buf->desc,
@@ -420,17 +451,19 @@ static void mvsw_sdma_rx_fini(struct mvsw_pr_rxtx_sdma *sdma)
 	}
 }
 
-static int mvsw_sdma_rx_init(struct mvsw_pr_rxtx_sdma *sdma)
+static int prestera_sdma_rx_init(struct prestera_rxtx_sdma *sdma)
 {
 	int q, b;
 	int err;
 
+	prestera_reg_write(sdma->sw, SDMA_RX_INTR_MASK_REG, 0);
+
 	/* disable all rx queues */
-	mvsw_reg_write(sdma->sw, SDMA_RX_QUEUE_STATUS_REG, 0xff00);
+	prestera_reg_write(sdma->sw, SDMA_RX_QUEUE_CMD_REG, 0xff00);
 
 	for (q = 0; q < SDMA_RX_QUEUE_NUM; q++) {
-		struct mvsw_sdma_rx_ring *ring = &sdma->rx_ring[q];
-		struct mvsw_sdma_buf *head;
+		struct prestera_sdma_rx_ring *ring = &sdma->rx_ring[q];
+		struct prestera_sdma_buf *head;
 
 		ring->bufs = kmalloc_array(SDMA_RX_DESC_PER_Q, sizeof(*head),
 					   GFP_KERNEL);
@@ -444,67 +477,69 @@ static int mvsw_sdma_rx_init(struct mvsw_pr_rxtx_sdma *sdma)
 		head = &ring->bufs[0];
 
 		for (b = 0; b < SDMA_RX_DESC_PER_Q; b++) {
-			struct mvsw_sdma_buf *buf = &ring->bufs[b];
+			struct prestera_sdma_buf *buf = &ring->bufs[b];
 
-			err = mvsw_sdma_buf_desc_alloc(sdma, buf);
+			err = prestera_sdma_buf_desc_alloc(sdma, buf);
 			if (err)
 				return err;
 
-			err = mvsw_sdma_rx_dma_alloc(sdma, buf);
+			err = prestera_sdma_rx_dma_alloc(sdma, buf);
 			if (err)
 				return err;
 
-			mvsw_sdma_rx_desc_init(sdma, buf->desc, buf->buf_dma);
+			prestera_sdma_rx_desc_init(sdma, buf->desc, buf->buf_dma);
 
 			if (b == 0)
 				continue;
 
-			mvsw_sdma_rx_desc_set_next(sdma, ring->bufs[b - 1].desc,
-						   buf->desc_dma);
+			prestera_sdma_rx_desc_set_next(sdma, ring->bufs[b - 1].desc,
+						       buf->desc_dma);
 
 			if (b == SDMA_RX_DESC_PER_Q - 1)
-				mvsw_sdma_rx_desc_set_next(sdma, buf->desc,
-							   head->desc_dma);
+				prestera_sdma_rx_desc_set_next(sdma, buf->desc,
+							       head->desc_dma);
 		}
 
-		mvsw_reg_write(sdma->sw, SDMA_RX_QUEUE_DESC_REG(q),
-			       mvsw_sdma_addr_phy(sdma, head->desc_dma));
+		prestera_reg_write(sdma->sw, SDMA_RX_QUEUE_DESC_REG(q),
+				   prestera_sdma_addr_phy(sdma, head->desc_dma));
 	}
 
 	/* make sure all rx descs are filled before enabling all rx queues */
 	wmb();
-	mvsw_reg_write(sdma->sw, SDMA_RX_QUEUE_STATUS_REG, 0xff);
+	prestera_reg_write(sdma->sw, SDMA_RX_QUEUE_CMD_REG, 0xff);
+	prestera_reg_write(sdma->sw, SDMA_RX_INTR_MASK_REG,
+			   (0xff << 2) | (0xff << 11));
 
 	return 0;
 }
 
-static void mvsw_sdma_tx_desc_init(struct mvsw_pr_rxtx_sdma *sdma,
-				   struct mvsw_sdma_desc *desc)
+static void prestera_sdma_tx_desc_init(struct prestera_rxtx_sdma *sdma,
+				       struct prestera_sdma_desc *desc)
 {
 	desc->word1 = cpu_to_le32(SDMA_TX_DESC_SINGLE | SDMA_TX_DESC_CALC_CRC);
 	desc->word2 = 0;
 }
 
-static void mvsw_sdma_tx_desc_set_next(struct mvsw_pr_rxtx_sdma *sdma,
-				       struct mvsw_sdma_desc *desc,
-				       dma_addr_t next)
+static void prestera_sdma_tx_desc_set_next(struct prestera_rxtx_sdma *sdma,
+					   struct prestera_sdma_desc *desc,
+					   dma_addr_t next)
 {
-	desc->next = cpu_to_le32(mvsw_sdma_addr_phy(sdma, next));
+	desc->next = cpu_to_le32(prestera_sdma_addr_phy(sdma, next));
 }
 
-static void mvsw_sdma_tx_desc_set_buf(struct mvsw_pr_rxtx_sdma *sdma,
-				      struct mvsw_sdma_desc *desc,
-				      dma_addr_t buf, size_t len)
+static void prestera_sdma_tx_desc_set_buf(struct prestera_rxtx_sdma *sdma,
+					  struct prestera_sdma_desc *desc,
+					  dma_addr_t buf, size_t len)
 {
 	u32 word = le32_to_cpu(desc->word2);
 
 	word = (word & ~GENMASK(30, 16)) | ((len + 4) << 16);
 
-	desc->buff = cpu_to_le32(mvsw_sdma_addr_phy(sdma, buf));
+	desc->buff = cpu_to_le32(prestera_sdma_addr_phy(sdma, buf));
 	desc->word2 = cpu_to_le32(word);
 }
 
-static void mvsw_sdma_tx_desc_xmit(struct mvsw_sdma_desc *desc)
+static void prestera_sdma_tx_desc_xmit(struct prestera_sdma_desc *desc)
 {
 	u32 word = le32_to_cpu(desc->word1);
 
@@ -515,9 +550,9 @@ static void mvsw_sdma_tx_desc_xmit(struct mvsw_sdma_desc *desc)
 	desc->word1 = cpu_to_le32(word);
 }
 
-static int mvsw_sdma_tx_buf_map(struct mvsw_pr_rxtx_sdma *sdma,
-				struct mvsw_sdma_buf *buf,
-				struct sk_buff *skb)
+static int prestera_sdma_tx_buf_map(struct prestera_rxtx_sdma *sdma,
+				    struct prestera_sdma_buf *buf,
+				    struct sk_buff *skb)
 {
 	struct device *dma_dev = sdma->sw->dev->dev;
 	struct sk_buff *new_skb;
@@ -563,28 +598,28 @@ err_alloc_skb:
 	return -ENOMEM;
 }
 
-static void mvsw_sdma_tx_buf_unmap(struct mvsw_pr_rxtx_sdma *sdma,
-				   struct mvsw_sdma_buf *buf)
+static void prestera_sdma_tx_buf_unmap(struct prestera_rxtx_sdma *sdma,
+				       struct prestera_sdma_buf *buf)
 {
 	struct device *dma_dev = sdma->sw->dev->dev;
 
 	dma_unmap_single(dma_dev, buf->buf_dma, buf->skb->len, DMA_TO_DEVICE);
 }
 
-static void mvsw_sdma_tx_recycle_work_fn(struct work_struct *work)
+static void prestera_sdma_tx_recycle_work_fn(struct work_struct *work)
 {
-	struct mvsw_sdma_tx_ring *tx_ring;
-	struct mvsw_pr_rxtx_sdma *sdma;
+	struct prestera_sdma_tx_ring *tx_ring;
+	struct prestera_rxtx_sdma *sdma;
 	struct device *dma_dev;
 	int b;
 
-	sdma = container_of(work, struct mvsw_pr_rxtx_sdma, tx_work);
+	sdma = container_of(work, struct prestera_rxtx_sdma, tx_work);
 
 	dma_dev = sdma->sw->dev->dev;
 	tx_ring = &sdma->tx_ring;
 
 	for (b = 0; b < SDMA_TX_DESC_PER_Q; b++) {
-		struct mvsw_sdma_buf *buf = &tx_ring->bufs[b];
+		struct prestera_sdma_buf *buf = &tx_ring->bufs[b];
 
 		if (!buf->is_used)
 			continue;
@@ -592,7 +627,7 @@ static void mvsw_sdma_tx_recycle_work_fn(struct work_struct *work)
 		if (!SDMA_TX_DESC_IS_SENT(buf->desc))
 			continue;
 
-		mvsw_sdma_tx_buf_unmap(sdma, buf);
+		prestera_sdma_tx_buf_unmap(sdma, buf);
 		dev_consume_skb_any(buf->skb);
 		buf->skb = NULL;
 
@@ -603,16 +638,16 @@ static void mvsw_sdma_tx_recycle_work_fn(struct work_struct *work)
 	}
 }
 
-static int mvsw_sdma_tx_init(struct mvsw_pr_rxtx_sdma *sdma)
+static int prestera_sdma_tx_init(struct prestera_rxtx_sdma *sdma)
 {
-	struct mvsw_sdma_tx_ring *tx_ring = &sdma->tx_ring;
-	struct mvsw_sdma_buf *head;
+	struct prestera_sdma_tx_ring *tx_ring = &sdma->tx_ring;
+	struct prestera_sdma_buf *head;
 	int err;
 	int b;
 
 	spin_lock_init(&sdma->tx_lock);
 
-	INIT_WORK(&sdma->tx_work, mvsw_sdma_tx_recycle_work_fn);
+	INIT_WORK(&sdma->tx_work, prestera_sdma_tx_recycle_work_fn);
 
 	tx_ring->bufs = kmalloc_array(SDMA_TX_DESC_PER_Q, sizeof(*head),
 				      GFP_KERNEL);
@@ -626,13 +661,13 @@ static int mvsw_sdma_tx_init(struct mvsw_pr_rxtx_sdma *sdma)
 	tx_ring->next_tx = 0;
 
 	for (b = 0; b < SDMA_TX_DESC_PER_Q; b++) {
-		struct mvsw_sdma_buf *buf = &tx_ring->bufs[b];
+		struct prestera_sdma_buf *buf = &tx_ring->bufs[b];
 
-		err = mvsw_sdma_buf_desc_alloc(sdma, buf);
+		err = prestera_sdma_buf_desc_alloc(sdma, buf);
 		if (err)
 			return err;
 
-		mvsw_sdma_tx_desc_init(sdma, buf->desc);
+		prestera_sdma_tx_desc_init(sdma, buf->desc);
 
 		buf->is_used = false;
 		buf->skb = NULL;
@@ -640,25 +675,25 @@ static int mvsw_sdma_tx_init(struct mvsw_pr_rxtx_sdma *sdma)
 		if (b == 0)
 			continue;
 
-		mvsw_sdma_tx_desc_set_next(sdma, tx_ring->bufs[b - 1].desc,
-					   buf->desc_dma);
+		prestera_sdma_tx_desc_set_next(sdma, tx_ring->bufs[b - 1].desc,
+					       buf->desc_dma);
 
 		if (b == SDMA_TX_DESC_PER_Q - 1)
-			mvsw_sdma_tx_desc_set_next(sdma, buf->desc,
-						   head->desc_dma);
+			prestera_sdma_tx_desc_set_next(sdma, buf->desc,
+						       head->desc_dma);
 	}
 
 	/* make sure descriptors are written */
 	wmb();
-	mvsw_reg_write(sdma->sw, SDMA_TX_QUEUE_DESC_REG,
-		       mvsw_sdma_addr_phy(sdma, head->desc_dma));
+	prestera_reg_write(sdma->sw, SDMA_TX_QUEUE_DESC_REG,
+			   prestera_sdma_addr_phy(sdma, head->desc_dma));
 
 	return 0;
 }
 
-static void mvsw_sdma_tx_fini(struct mvsw_pr_rxtx_sdma *sdma)
+static void prestera_sdma_tx_fini(struct prestera_rxtx_sdma *sdma)
 {
-	struct mvsw_sdma_tx_ring *ring = &sdma->tx_ring;
+	struct prestera_sdma_tx_ring *ring = &sdma->tx_ring;
 	int b;
 
 	cancel_work_sync(&sdma->tx_work);
@@ -667,7 +702,7 @@ static void mvsw_sdma_tx_fini(struct mvsw_pr_rxtx_sdma *sdma)
 		return;
 
 	for (b = 0; b < SDMA_TX_DESC_PER_Q; b++) {
-		struct mvsw_sdma_buf *buf = &ring->bufs[b];
+		struct prestera_sdma_buf *buf = &ring->bufs[b];
 
 		if (buf->desc)
 			dma_pool_free(sdma->desc_pool, buf->desc,
@@ -683,25 +718,38 @@ static void mvsw_sdma_tx_fini(struct mvsw_pr_rxtx_sdma *sdma)
 	}
 }
 
-static void mvsw_rxtx_handle_event(struct prestera_switch *sw,
-				   struct prestera_event *evt, void *arg)
+static void prestera_rxtx_handle_event(struct prestera_switch *sw,
+				       struct prestera_event *evt, void *arg)
 {
-	struct mvsw_pr_rxtx_sdma *sdma = arg;
+	struct prestera_rxtx_sdma *sdma = arg;
+	u32 err;
 
 	if (evt->id != PRESTERA_RXTX_EVENT_RCV_PKT)
 		return;
 
-	mvsw_reg_write(sdma->sw, SDMA_RX_INTR_MASK_REG, 0);
+	/* fix soft reset issue which was observed on ac5x devices */
+	if (sw->dev_id_type == PRESTERA_DEV_ID_TYPE_AC5X) {
+		err = prestera_reg_read(sdma->sw, SDMA_RX_INTR_CAUSE_REG);
+		err = FIELD_GET(SDMA_RX_QUEUE_ERR_STATUS_MASK, err);
+		if (err) {
+			dev_err_ratelimited(sdma->sw->dev->dev, "SDMA RX error occurred, try to fix it by resetting the ring buffer\n");
+			prestera_sdma_rx_fini(sdma);
+			prestera_sdma_rx_init(sdma);
+			return;
+		}
+	}
+
+	prestera_reg_write(sdma->sw, SDMA_RX_INTR_MASK_REG, 0);
 	napi_schedule(&sdma->rx_napi);
 }
 
 int prestera_rxtx_switch_init(struct prestera_switch *sw)
 {
-	struct mvsw_pr_rxtx_sdma *sdma;
+	struct prestera_rxtx_sdma *sdma;
 	int err;
 
 	cpu_code_stats = kzalloc(sizeof(u64) *
-				 MVSW_PR_RXTX_CPU_CODE_MAX_NUM, GFP_KERNEL);
+				 PRESTERA_RXTX_CPU_CODE_MAX_NUM, GFP_KERNEL);
 	if (!cpu_code_stats)
 		return -ENOMEM;
 
@@ -724,41 +772,41 @@ int prestera_rxtx_switch_init(struct prestera_switch *sw)
 	sdma->sw = sw;
 
 	sdma->desc_pool = dma_pool_create("desc_pool", sdma->sw->dev->dev,
-					  sizeof(struct mvsw_sdma_desc), 16, 0);
+					  sizeof(struct prestera_sdma_desc), 16, 0);
 	if (!sdma->desc_pool) {
 		err = -ENOMEM;
 		goto err_dma_pool;
 	}
 
-	err = mvsw_sdma_rx_init(sdma);
+	err = prestera_sdma_rx_init(sdma);
 	if (err) {
 		dev_err(sw->dev->dev, "failed to init rx ring\n");
 		goto err_rx_init;
 	}
 
-	err = mvsw_sdma_tx_init(sdma);
+	err = prestera_sdma_tx_init(sdma);
 	if (err) {
 		dev_err(sw->dev->dev, "failed to init tx ring\n");
 		goto err_tx_init;
 	}
 
 	err = prestera_hw_event_handler_register(sw, PRESTERA_EVENT_TYPE_RXTX,
-						 mvsw_rxtx_handle_event, sdma);
+						 prestera_rxtx_handle_event, sdma);
 	if (err)
 		goto err_evt_register;
 
 	init_dummy_netdev(&sdma->napi_dev);
 
-	netif_napi_add(&sdma->napi_dev, &sdma->rx_napi, mvsw_sdma_rx_poll, 64);
+	netif_napi_add(&sdma->napi_dev, &sdma->rx_napi, prestera_sdma_rx_poll, 64);
 	napi_enable(&sdma->rx_napi);
 
 	return 0;
 
 err_evt_register:
 err_tx_init:
-	mvsw_sdma_tx_fini(sdma);
+	prestera_sdma_tx_fini(sdma);
 err_rx_init:
-	mvsw_sdma_rx_fini(sdma);
+	prestera_sdma_rx_fini(sdma);
 
 	dma_pool_destroy(sdma->desc_pool);
 err_dma_pool:
@@ -771,26 +819,26 @@ err_rxtx_alloc:
 
 void prestera_rxtx_switch_fini(struct prestera_switch *sw)
 {
-	struct mvsw_pr_rxtx_sdma *sdma = &sw->rxtx->sdma;
+	struct prestera_rxtx_sdma *sdma = &sw->rxtx->sdma;
 
 	prestera_hw_event_handler_unregister(sw, PRESTERA_EVENT_TYPE_RXTX);
 	napi_disable(&sdma->rx_napi);
 	netif_napi_del(&sdma->rx_napi);
-	mvsw_sdma_rx_fini(sdma);
-	mvsw_sdma_tx_fini(sdma);
+	prestera_sdma_rx_fini(sdma);
+	prestera_sdma_tx_fini(sdma);
 	dma_pool_destroy(sdma->desc_pool);
 	kfree(sw->rxtx);
 	sw->rxtx = NULL;
 	kfree(cpu_code_stats);
 }
 
-static int mvsw_sdma_wait_tx(struct mvsw_pr_rxtx_sdma *sdma,
-			     struct mvsw_sdma_tx_ring *tx_ring)
+static int prestera_sdma_wait_tx(struct prestera_rxtx_sdma *sdma,
+				 struct prestera_sdma_tx_ring *tx_ring)
 {
 	int tx_retry_num = 10 * tx_ring->max_burst;
 
 	while (--tx_retry_num) {
-		if (!(mvsw_reg_read(sdma->sw, SDMA_TX_QUEUE_START_REG) & 1))
+		if (!(prestera_reg_read(sdma->sw, SDMA_TX_QUEUE_START_REG) & 1))
 			return 0;
 
 		udelay(5);
@@ -799,20 +847,20 @@ static int mvsw_sdma_wait_tx(struct mvsw_pr_rxtx_sdma *sdma,
 	return -EBUSY;
 }
 
-static void mvsw_sdma_start_tx(struct mvsw_pr_rxtx_sdma *sdma)
+static void prestera_sdma_start_tx(struct prestera_rxtx_sdma *sdma)
 {
-	mvsw_reg_write(sdma->sw, SDMA_TX_QUEUE_START_REG, 1);
+	prestera_reg_write(sdma->sw, SDMA_TX_QUEUE_START_REG, 1);
 	schedule_work(&sdma->tx_work);
 }
 
-static int mvsw_pr_rxtx_sdma_xmit(struct prestera_rxtx *rxtx,
-				  struct sk_buff *skb)
+static int prestera_rxtx_sdma_xmit(struct prestera_rxtx *rxtx,
+				   struct sk_buff *skb)
 {
-	struct mvsw_pr_rxtx_sdma *sdma = &rxtx->sdma;
+	struct prestera_rxtx_sdma *sdma = &rxtx->sdma;
 	struct device *dma_dev = sdma->sw->dev->dev;
-	struct mvsw_sdma_tx_ring *tx_ring;
+	struct prestera_sdma_tx_ring *tx_ring;
 	struct net_device *dev = skb->dev;
-	struct mvsw_sdma_buf *buf;
+	struct prestera_sdma_buf *buf;
 	int err;
 
 	spin_lock(&sdma->tx_lock);
@@ -831,11 +879,11 @@ static int mvsw_pr_rxtx_sdma_xmit(struct prestera_rxtx *rxtx,
 		goto drop_skb;
 	}
 
-	err = mvsw_sdma_tx_buf_map(sdma, buf, skb);
+	err = prestera_sdma_tx_buf_map(sdma, buf, skb);
 	if (err)
 		goto drop_skb;
 
-	mvsw_sdma_tx_desc_set_buf(sdma, buf->desc, buf->buf_dma, skb->len);
+	prestera_sdma_tx_desc_set_buf(sdma, buf->desc, buf->buf_dma, skb->len);
 
 	dma_sync_single_for_device(dma_dev, buf->buf_dma, skb->len,
 				   DMA_TO_DEVICE);
@@ -843,21 +891,21 @@ static int mvsw_pr_rxtx_sdma_xmit(struct prestera_rxtx *rxtx,
 	if (!tx_ring->burst--) {
 		tx_ring->burst = tx_ring->max_burst;
 
-		err = mvsw_sdma_wait_tx(sdma, tx_ring);
+		err = prestera_sdma_wait_tx(sdma, tx_ring);
 		if (err)
 			goto drop_skb_unmap;
 	}
 
 	tx_ring->next_tx = (tx_ring->next_tx + 1) % SDMA_TX_DESC_PER_Q;
-	mvsw_sdma_tx_desc_xmit(buf->desc);
+	prestera_sdma_tx_desc_xmit(buf->desc);
 	buf->is_used = true;
 
-	mvsw_sdma_start_tx(sdma);
+	prestera_sdma_start_tx(sdma);
 
 	goto tx_done;
 
 drop_skb_unmap:
-	mvsw_sdma_tx_buf_unmap(sdma, buf);
+	prestera_sdma_tx_buf_unmap(sdma, buf);
 drop_skb:
 	dev->stats.tx_dropped++;
 tx_done:
@@ -867,18 +915,33 @@ tx_done:
 
 netdev_tx_t prestera_rxtx_xmit(struct sk_buff *skb, struct prestera_port *port)
 {
-	size_t dsa_resize_len = MVSW_PR_DSA_HLEN;
+	size_t dsa_resize_len;
 	struct prestera_rxtx_stats *rxtx_stats;
-	struct mvsw_pr_dsa_from_cpu *from_cpu;
-	struct mvsw_pr_dsa dsa;
+	struct prestera_dsa_from_cpu *from_cpu;
+	struct prestera_dsa dsa;
+	struct prestera_rxtx_sdma *sdma;
+
 	u64 skb_len = skb->len;
+
+	if (skb_len > SDMA_BUFF_SIZE_MAX)
+		goto tx_drop;
 
 	if (unlikely(!port->sw || !port->sw->rxtx))
 		goto tx_drop;
 
+	sdma = &port->sw->rxtx->sdma;
+
 	/* common DSA tag fill-up */
 	memset(&dsa, 0, sizeof(dsa));
-	dsa.dsa_cmd = MVSW_NET_DSA_CMD_FROM_CPU_E;
+	dsa.dsa_cmd = PRESTERA_DSA_CMD_FROM_CPU;
+
+	if (sdma->sw->dev_type == PRESTERA_SWITCH_TYPE_AC5) {
+		dsa_resize_len = PRESTERA_DSA_AC5_HLEN;
+		dsa.dsa_type = PRESTERA_DSA_TYPE_EXTDSA8;
+	} else {
+		dsa_resize_len = PRESTERA_DSA_HLEN;
+		dsa.dsa_type = PRESTERA_DSA_TYPE_EDSA16;
+	}
 
 	from_cpu = &dsa.dsa_info.from_cpu;
 	from_cpu->egr_filter_en = false;
@@ -894,7 +957,7 @@ netdev_tx_t prestera_rxtx_xmit(struct sk_buff *skb, struct prestera_port *port)
 	 */
 	/* If (skb->protocol == htons(ETH_P_8021Q)) { */
 		/* 802.1q packet tag size is 4 bytes, so DSA len would
-		 * need only allocation of MVSW_PR_DSA_HLEN - size of
+		 * need only allocation of PRESTERA_DSA_HLEN - size of
 		 * 802.1q tag
 		 */
 		/*dsa.common_params.vpt = skb_vlan_tag_get_prio(skb);
@@ -911,10 +974,10 @@ netdev_tx_t prestera_rxtx_xmit(struct sk_buff *skb, struct prestera_port *port)
 	skb_push(skb, dsa_resize_len);
 	memmove(skb->data, skb->data + dsa_resize_len, 2 * ETH_ALEN);
 
-	if (mvsw_pr_dsa_build(&dsa, skb->data + 2 * ETH_ALEN) != 0)
+	if (prestera_dsa_build(&dsa, skb->data + 2 * ETH_ALEN) != 0)
 		goto tx_drop_stats_inc;
 
-	if (mvsw_pr_rxtx_sdma_xmit(port->sw->rxtx, skb))
+	if (prestera_rxtx_sdma_xmit(port->sw->rxtx, skb))
 		goto tx_drop_stats_inc;
 
 	rxtx_stats = this_cpu_ptr(port->rxtx_stats);
@@ -932,7 +995,7 @@ tx_drop:
 	return NET_XMIT_DROP;
 }
 
-u64 mvsw_pr_rxtx_get_cpu_code_stats(u8 cpu_code)
+u64 prestera_rxtx_get_cpu_code_stats(u8 cpu_code)
 {
 	return cpu_code_stats[cpu_code];
 }

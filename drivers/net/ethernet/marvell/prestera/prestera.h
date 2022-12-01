@@ -10,8 +10,12 @@
 #include <linux/if_macvlan.h>
 #include <linux/workqueue.h>
 #include <linux/phylink.h>
-#include <net/pkt_cls.h>
 #include <net/devlink.h>
+
+#define prestera_reg_write(sw, reg, val) \
+	writel(val, (sw)->dev->pp_regs + (reg))
+#define prestera_reg_read(sw, reg) \
+	readl((sw)->dev->pp_regs + (reg))
 
 #define PRESTERA_DRV_NAME       "prestera"
 
@@ -20,7 +24,7 @@
 
 #define PRESTERA_DEFAULT_VID 1
 
-#define PRESTERA_MIN_AGEING_TIME 32000
+#define PRESTERA_MIN_AGEING_TIME 30000
 #define PRESTERA_MAX_AGEING_TIME 1000000000
 #define PRESTERA_DEFAULT_AGEING_TIME 300000
 
@@ -29,7 +33,6 @@
 
 #define PRESTERA_PORT_SRCID_ZERO 0 /* source_id */
 
-#define PRESTERA_SPAN_INVALID_ID -1
 #define PRESTERA_QOS_SP_COUNT 8
 
 #define PRESTERA_IPG_DEFAULT_VALUE (12)
@@ -53,23 +56,22 @@ struct prestera_storm_control;
 struct prestera_qos;
 struct prestera_qdisc;
 
-struct prestera_flow_block_binding {
-	struct list_head list;
-	struct prestera_port *port;
-	int span_id;
+struct prestera_ip_addr {
+	enum {
+		PRESTERA_IPV4 = 0,
+		PRESTERA_IPV6
+	} v;
+	union {
+		__be32 ipv4;
+		struct in6_addr ipv6;
+	} u;
+#define PRESTERA_IP_ADDR_PLEN(V) ((V) == PRESTERA_IPV4 ? 32 : \
+				  /* (V) == PRESTERA_IPV6 ? */ 128 /* : 0 */)
 };
 
-struct prestera_flow_block {
-	struct list_head binding_list;
-	struct list_head template_list;
-	struct prestera_switch *sw;
-	unsigned int rule_count;
-	struct net *net;
-	struct prestera_acl_ruleset *ruleset_zero;
-	struct flow_block_cb *block_cb;
-	u32 mall_prio;
-	u32 flower_min_prio;
-	bool ingress;
+struct prestera_l2tun_vp_key {
+	void *id;
+	struct prestera_ip_addr ip;
 };
 
 struct prestera_port_vlan {
@@ -95,9 +97,26 @@ struct prestera_mdb_entry {
 
 struct prestera_flood_domain_port {
 	struct prestera_flood_domain *flood_domain;
-	struct net_device *dev;
+	struct prestera_l2tun_vp *vp; /* PRESTERA_FLOOD_DOMAIN_PORT_TYPE_TEP */
+	struct prestera_flood_domain_port_key {
+		enum {
+			PRESTERA_FLOOD_DOMAIN_PORT_TYPE_DEV = 0,
+			PRESTERA_FLOOD_DOMAIN_PORT_TYPE_VLAN,
+			PRESTERA_FLOOD_DOMAIN_PORT_TYPE_TEP
+		} type;
+		union {
+			struct {
+				struct net_device *dev; /* PRESTERA_FLOOD_DOMAIN_PORT_TYPE_DEV */
+				u16 vid; /* PRESTERA_FLOOD_DOMAIN_PORT_TYPE_DEV */
+			} dev_port;
+			struct {
+				/* PRESTERA_FLOOD_DOMAIN_PORT_TYPE_TEP */
+				struct prestera_l2tun_vp_key vp_key;
+			} tep;
+		};
+	} key;
 	struct list_head flood_domain_port_node;
-	u16 vid;
+	struct list_head vport_node; /* PRESTERA_FLOOD_DOMAIN_PORT_TYPE_TEP */
 };
 
 struct prestera_port_stats {
@@ -285,6 +304,7 @@ enum prestera_fdb_event_id {
 enum prestera_fdb_entry_type {
 	PRESTERA_FDB_ENTRY_TYPE_REG_PORT,
 	PRESTERA_FDB_ENTRY_TYPE_LAG,
+	PRESTERA_FDB_ENTRY_TYPE_TEP,
 	PRESTERA_FDB_ENTRY_TYPE_MAX
 };
 
@@ -376,9 +396,21 @@ struct prestera_rif;
 struct prestera_trap_data;
 struct prestera_rxtx;
 
+#define PRESTERA_DEV_ID_TYPE_AC5	0xB400
+#define PRESTERA_DEV_ID_TYPE_AC5X	0x9800
+
+enum prestera_switch_type {
+	/* eARCH: AC3X, ALDRIN2, AC5X */
+	PRESTERA_SWITCH_TYPE_EARCH,
+	/* AC5 */
+	PRESTERA_SWITCH_TYPE_AC5,
+};
+
 struct prestera_switch {
 	struct list_head list;
 	struct prestera_device *dev;
+	enum prestera_switch_type dev_type;
+	u16 dev_id_type;
 	struct list_head event_handlers;
 	char base_mac[ETH_ALEN];
 	struct list_head port_list;
@@ -413,6 +445,12 @@ struct prestera_router {
 	struct rhashtable fib_ht;
 	struct rhashtable kern_fib_cache_ht;
 	struct rhashtable kern_neigh_cache_ht;
+	struct {
+		struct rhashtable l2tun_vp_ht;
+		struct rhashtable l2tun_vp_hw_index_ht;
+		struct rhashtable l2tun_tep_ht;
+		struct rhashtable l2tun_tt_ht;
+	} nve;
 	u8 *nhgrp_hw_state_cache; /* Bitmap cached hw state of nhs */
 	unsigned long nhgrp_hw_cache_kick; /* jiffies */
 	struct {
@@ -433,109 +471,11 @@ enum prestera_fdb_flush_mode {
 				    | PRESTERA_FDB_FLUSH_MODE_STATIC,
 };
 
-struct prestera_ip_addr {
-	enum {
-		PRESTERA_IPV4 = 0,
-		PRESTERA_IPV6
-	} v;
-	union {
-		__be32 ipv4;
-		struct in6_addr ipv6;
-	} u;
-#define PRESTERA_IP_ADDR_PLEN(V) ((V) == PRESTERA_IPV4 ? 32 : \
-				  /* (V) == PRESTERA_IPV6 ? */ 128 /* : 0 */)
-};
-
 /* Used for hw call */
 struct prestera_neigh_info {
 	struct prestera_iface iface;
 	unsigned char ha[ETH_ALEN];
 	bool connected; /* indicate, if mac/oif valid */
-};
-
-enum prestera_acl_match_type {
-	PRESTERA_ACL_RULE_MATCH_TYPE_PCL_ID,
-	PRESTERA_ACL_RULE_MATCH_TYPE_ETH_TYPE,
-	PRESTERA_ACL_RULE_MATCH_TYPE_ETH_DMAC_0,
-	PRESTERA_ACL_RULE_MATCH_TYPE_ETH_DMAC_1,
-	PRESTERA_ACL_RULE_MATCH_TYPE_ETH_SMAC_0,
-	PRESTERA_ACL_RULE_MATCH_TYPE_ETH_SMAC_1,
-	PRESTERA_ACL_RULE_MATCH_TYPE_IP_PROTO,
-	PRESTERA_ACL_RULE_MATCH_TYPE_SYS_PORT,
-	PRESTERA_ACL_RULE_MATCH_TYPE_SYS_DEV,
-	PRESTERA_ACL_RULE_MATCH_TYPE_IP_SRC,
-	PRESTERA_ACL_RULE_MATCH_TYPE_IP_DST,
-	PRESTERA_ACL_RULE_MATCH_TYPE_L4_PORT_SRC,
-	PRESTERA_ACL_RULE_MATCH_TYPE_L4_PORT_DST,
-	PRESTERA_ACL_RULE_MATCH_TYPE_L4_PORT_RANGE_SRC,
-	PRESTERA_ACL_RULE_MATCH_TYPE_L4_PORT_RANGE_DST,
-	PRESTERA_ACL_RULE_MATCH_TYPE_VLAN_ID,
-	PRESTERA_ACL_RULE_MATCH_TYPE_VLAN_TPID,
-	PRESTERA_ACL_RULE_MATCH_TYPE_ICMP_TYPE,
-	PRESTERA_ACL_RULE_MATCH_TYPE_ICMP_CODE,
-	PRESTERA_ACL_RULE_MATCH_TYPE_QOS_PROFILE,
-
-	__PRESTERA_ACL_RULE_MATCH_TYPE_MAX
-};
-
-struct prestera_acl_match {
-	__be32 key[__PRESTERA_ACL_RULE_MATCH_TYPE_MAX];
-	__be32 mask[__PRESTERA_ACL_RULE_MATCH_TYPE_MAX];
-};
-
-enum prestera_acl_rule_action {
-	PRESTERA_ACL_RULE_ACTION_ACCEPT,
-	PRESTERA_ACL_RULE_ACTION_DROP,
-	PRESTERA_ACL_RULE_ACTION_TRAP,
-	PRESTERA_ACL_RULE_ACTION_POLICE,
-	PRESTERA_ACL_RULE_ACTION_NAT,
-	PRESTERA_ACL_RULE_ACTION_JUMP,
-	PRESTERA_ACL_RULE_ACTION_NH,
-	PRESTERA_ACL_RULE_ACTION_COUNT,
-	PRESTERA_ACL_RULE_ACTION_REMARK
-};
-
-struct prestera_acl_action_jump {
-	u32 index;
-};
-
-struct prestera_acl_action_trap {
-	u8 hw_tc;
-};
-
-struct prestera_acl_action_police {
-	u64 rate;
-	u64 burst;
-};
-
-struct prestera_acl_action_nat {
-	__be32 old_addr;
-	__be32 new_addr;
-	u32 port;
-	u32 dev;
-	u32 flags;
-};
-
-struct prestera_acl_action_count {
-	u32 id;
-};
-
-struct prestera_acl_action_remark {
-	u32 dscp;
-};
-
-/* Used for hw call */
-struct prestera_acl_hw_action_info {
-	enum prestera_acl_rule_action id;
-	union {
-		struct prestera_acl_action_trap trap;
-		struct prestera_acl_action_police police;
-		u32 nh;
-		struct prestera_acl_action_nat nat;
-		struct prestera_acl_action_jump jump;
-		struct prestera_acl_action_count count;
-		struct prestera_acl_action_remark remark;
-	};
 };
 
 struct prestera_nh_neigh_key {
@@ -561,10 +501,73 @@ struct prestera_nh_neigh {
 	struct rhash_head ht_node; /* node of mvsw_pr_vr */
 	struct list_head nexthop_group_list;
 	struct list_head nh_mangle_entry_list;
+	struct list_head l2tun_tep_list;
 };
 
 struct prestera_nexthop_group_key {
 	struct prestera_nh_neigh_key neigh[PRESTERA_NHGR_SIZE_MAX];
+};
+
+/* NVE */
+struct prestera_l2tun_vp {
+	struct prestera_l2tun_vp_key key;
+	u32 hw_tep_id;
+	struct list_head l2tun_tt_list;
+	struct list_head l2tun_tep_list;
+	struct list_head flood_domain_port_list;
+	struct rhash_head ht_node; /* node of router */
+	struct rhash_head hw_index_ht_node; /* node of router */
+};
+
+struct prestera_l2tun_tep_cfg {
+		struct prestera_ip_addr dip;
+		struct prestera_ip_addr sip;
+		u16 l4_src;
+		u16 l4_dst;
+		u32 vni;
+		u32 source_id;
+};
+
+struct prestera_l2tun_tep {
+	struct prestera_l2tun_tep_key {
+		struct prestera_l2tun_vp_key vp_key;
+	} key;
+	struct prestera_l2tun_tep_cfg cfg;
+	struct prestera_nh_neigh *n;
+	struct list_head nh_neigh_head;
+	struct prestera_l2tun_vp *vp;
+	struct list_head l2tun_vp_head;
+	struct rhash_head ht_node; /* node of router */
+	struct {
+		refcount_t refcount;
+	} ext;
+};
+
+struct prestera_l2tun_tt {
+	struct prestera_l2tun_tt_key {
+		struct prestera_ip_addr ip;
+		bool match_src_ip;
+		struct prestera_ip_addr src_ip;
+		u16 port;
+		u32 vni;
+	} key;
+	u16 pvid;
+	u32 source_id;
+	struct prestera_l2tun_vp *vp;
+	struct list_head l2tun_vp_head;
+	u32 hw_tt_id;
+	struct rhash_head ht_node; /* node of router */
+};
+
+struct prestera_l2tun_tep_fdb {
+	struct prestera_l2tun_tep_fdb_key {
+		unsigned char ha[ETH_ALEN];
+		u16 vid;
+	} key;
+	bool dynamic;
+	struct prestera_l2tun_tep *tep;
+	struct list_head l2tun_tep_head;
+	struct rhash_head ht_node; /* node of router */
 };
 
 struct prestera_port *dev_to_prestera_port(struct device *dev);
@@ -576,6 +579,7 @@ int prestera_port_uc_flood_set(struct prestera_port *port, bool flood);
 int prestera_port_mc_flood_set(struct prestera_port *port, bool flood);
 int prestera_port_isolation_grp_set(struct prestera_port *port,
 				    u32 sourceid);
+int prestera_port_br_locked_set(struct prestera_port *port, bool br_locked);
 int prestera_port_pvid_set(struct prestera_port *port, u16 vid);
 int prestera_port_vid_stp_set(struct prestera_port *port, u16 vid, u8 state);
 struct prestera_port_vlan *
@@ -601,32 +605,7 @@ int prestera_lag_id_find(struct prestera_switch *sw, struct net_device *lag_dev,
 void prestera_lag_member_rif_leave(const struct prestera_port *port,
 				   u16 lag_id, u16 vr_id);
 
-/* SPAN */
-int prestera_span_get(struct prestera_port *port, u8 *span_id);
-int prestera_span_put(const struct prestera_switch *sw, u8 span_id);
-
 int prestera_dev_if_type(const struct net_device *dev);
-
-/* prestera_matchall.c */
-int prestera_mall_replace(struct prestera_flow_block *block,
-			  struct tc_cls_matchall_offload *f);
-void prestera_mall_destroy(struct prestera_flow_block *block);
-int prestera_mall_prio_get(struct prestera_flow_block *block,
-			   u32 *prio);
-
-/* prestera_flow.c */
-int prestera_setup_tc_block(struct prestera_port *port,
-			    struct flow_block_offload *f);
-
-/* prestera_acl.c */
-int prestera_acl_init(struct prestera_switch *sw);
-void prestera_acl_fini(struct prestera_switch *sw);
-struct net *prestera_acl_block_net(struct prestera_flow_block *block);
-struct prestera_switch *
-prestera_acl_block_sw(struct prestera_flow_block *block);
-unsigned int prestera_acl_block_rule_count(struct prestera_flow_block *block);
-void prestera_acl_block_prio_update(struct prestera_switch *sw,
-				    struct prestera_flow_block *block);
 
 /* ACL-NAT */
 struct prestera_acl_nat_port *
@@ -654,11 +633,10 @@ void prestera_flood_domain_destroy(struct prestera_flood_domain *flood_domain);
 
 int
 prestera_flood_domain_port_create(struct prestera_flood_domain *flood_domain,
-				  struct net_device *dev,
-				  u16 vid);
+				  struct prestera_flood_domain_port_key *key);
 struct prestera_flood_domain_port *
 prestera_flood_domain_port_find(struct prestera_flood_domain *flood_domain,
-				struct net_device *dev, u16 vid);
+				struct prestera_flood_domain_port_key *key);
 void
 prestera_flood_domain_port_destroy(struct prestera_flood_domain_port *port);
 
@@ -737,5 +715,55 @@ void prestera_bridge_rifs_destroy(struct prestera_switch *sw,
 void prestera_k_arb_fdb_evt(struct prestera_switch *sw, struct net_device *dev);
 struct prestera_neigh_info *
 prestera_kern_neigh_cache_to_neigh_info(struct prestera_kern_neigh_cache *nc);
+
+int prestera_l2tun_init(struct prestera_switch *sw);
+void prestera_l2tun_fini(struct prestera_switch *sw);
+
+struct prestera_l2tun_vp *
+prestera_l2tun_vp_find(struct prestera_switch *sw,
+		       struct prestera_l2tun_vp_key *key);
+struct prestera_l2tun_vp *
+prestera_l2tun_vp_find_hw_index(struct prestera_switch *sw, u32 id);
+struct prestera_l2tun_vp *
+prestera_l2tun_vp_get(struct prestera_switch *sw,
+		      struct prestera_l2tun_vp_key *key);
+void prestera_l2tun_vp_put(struct prestera_switch *sw,
+			   struct prestera_l2tun_vp *o);
+int prestera_l2tun_vp_util_fdb_set(struct prestera_switch *sw,
+				   struct prestera_l2tun_vp_key *key,
+				   u8 *mac, u16 vid, bool enable, bool dynamic);
+
+struct prestera_l2tun_tep *
+prestera_l2tun_tep_find(struct prestera_switch *sw,
+			struct prestera_l2tun_tep_key *key);
+void prestera_l2tun_tep_destroy(struct prestera_switch *sw,
+				struct prestera_l2tun_tep *tep);
+int prestera_l2tun_tep_set(struct prestera_switch *sw,
+			   struct prestera_l2tun_tep *tep);
+struct prestera_l2tun_tep *
+prestera_l2tun_tep_create(struct prestera_switch *sw,
+			  struct prestera_l2tun_tep_key *key,
+			  struct prestera_l2tun_tep_cfg *cfg,
+			  struct prestera_nh_neigh_key *n_key);
+
+struct prestera_l2tun_tt *
+prestera_l2tun_tt_find(struct prestera_switch *sw,
+		       struct prestera_l2tun_tt_key *key);
+void prestera_l2tun_tt_destroy(struct prestera_switch *sw,
+			       struct prestera_l2tun_tt *tt);
+struct prestera_l2tun_tt *
+prestera_l2tun_tt_create(struct prestera_switch *sw,
+			 struct prestera_l2tun_tt_key *key, u16 pvid,
+			 struct prestera_l2tun_vp_key *vp_key, u32 source_id);
+struct prestera_l2tun_tep_fdb *
+prestera_l2tun_tep_fdb_find(struct prestera_switch *sw,
+			    struct prestera_l2tun_tep_fdb_key *key);
+void prestera_l2tun_tep_fdb_destroy(struct prestera_switch *sw,
+				    struct prestera_l2tun_tep_fdb *tf);
+struct prestera_l2tun_tep_fdb *
+prestera_l2tun_tep_fdb_create(struct prestera_switch *sw,
+			      struct prestera_l2tun_tep_fdb_key *key,
+			      bool dynamic,
+			      struct prestera_l2tun_tep_key *tep_key);
 
 #endif /* _PRESTERA_H_ */

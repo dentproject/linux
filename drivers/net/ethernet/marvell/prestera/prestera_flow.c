@@ -3,22 +3,19 @@
 
 #include <linux/kernel.h>
 #include <linux/list.h>
-#include <linux/netdevice.h>
 
 #include "prestera.h"
 #include "prestera_acl.h"
+#include "prestera_flow.h"
 #include "prestera_flower.h"
+#include "prestera_matchall.h"
+#include "prestera_span.h"
 
 static LIST_HEAD(prestera_block_cb_list);
 
 static int prestera_flow_block_mall_cb(struct prestera_flow_block *block,
 				       struct tc_cls_matchall_offload *f)
 {
-	if (f->common.chain_index != 0) {
-		NL_SET_ERR_MSG(f->common.extack, "Only chain 0 is supported");
-		return -EOPNOTSUPP;
-	}
-
 	switch (f->command) {
 	case TC_CLSMATCHALL_REPLACE:
 		return prestera_mall_replace(block, f);
@@ -76,6 +73,29 @@ static void prestera_flow_block_destroy(void *cb_priv)
 	WARN_ON(!list_empty(&block->binding_list));
 
 	kfree(block);
+}
+
+static struct prestera_flow_block *
+prestera_flow_block_create(struct prestera_switch *sw,
+			   struct net *net,
+			   bool ingress)
+{
+	struct prestera_flow_block *block;
+
+	block = kzalloc(sizeof(*block), GFP_KERNEL);
+	if (!block)
+		return NULL;
+
+	INIT_LIST_HEAD(&block->binding_list);
+	INIT_LIST_HEAD(&block->template_list);
+	block->net = net;
+	block->sw = sw;
+	block->mall.prio_min = UINT_MAX;
+	block->mall.prio_max = 0;
+	block->mall.bound = false;
+	block->ingress = ingress;
+
+	return block;
 }
 
 static void prestera_flow_block_release(void *cb_priv)
@@ -150,28 +170,6 @@ static int prestera_flow_block_unbind(struct prestera_flow_block *block,
 }
 
 static struct prestera_flow_block *
-prestera_flow_block_create(struct prestera_switch *sw,
-			   struct net *net,
-			   bool ingress)
-{
-	struct prestera_flow_block *block;
-
-	block = kzalloc(sizeof(*block), GFP_KERNEL);
-	if (!block)
-		return NULL;
-
-	INIT_LIST_HEAD(&block->binding_list);
-	INIT_LIST_HEAD(&block->template_list);
-	block->net = net;
-	block->sw = sw;
-	block->mall_prio = UINT_MAX;
-	block->flower_min_prio = UINT_MAX;
-	block->ingress = ingress;
-
-	return block;
-}
-
-static struct prestera_flow_block *
 prestera_flow_block_get(struct prestera_switch *sw,
 			struct flow_block_offload *f,
 			bool *register_block,
@@ -218,8 +216,8 @@ static void prestera_flow_block_put(struct prestera_flow_block *block)
 	prestera_flow_block_destroy(block);
 }
 
-static int prestera_setup_tc_block_bind(struct prestera_port *port,
-					struct flow_block_offload *f, bool ingress)
+static int prestera_setup_flow_block_bind(struct prestera_port *port,
+					  struct flow_block_offload *f, bool ingress)
 {
 	struct prestera_switch *sw = port->sw;
 	struct prestera_flow_block *block;
@@ -251,11 +249,12 @@ static int prestera_setup_tc_block_bind(struct prestera_port *port,
 
 err_block_bind:
 	prestera_flow_block_put(block);
+
 	return err;
 }
 
-static void prestera_setup_tc_block_unbind(struct prestera_port *port,
-					   struct flow_block_offload *f, bool ingress)
+static void prestera_setup_flow_block_unbind(struct prestera_port *port,
+					     struct flow_block_offload *f, bool ingress)
 {
 	struct prestera_switch *sw = port->sw;
 	struct prestera_flow_block *block;
@@ -272,45 +271,44 @@ static void prestera_setup_tc_block_unbind(struct prestera_port *port,
 
 	err = prestera_flow_block_unbind(block, port);
 	if (err)
-		goto err_flow_block_unbind;
+		goto error;
 
 	if (!flow_block_cb_decref(block_cb)) {
 		flow_block_cb_remove(block_cb, f);
 		list_del(&block_cb->driver_list);
 	}
-
-err_flow_block_unbind:
+error:
 	if (ingress)
 		port->ingress_flow_block = NULL;
 	else
 		port->egress_flow_block = NULL;
 }
 
-static int prestera_setup_tc_block_clsact(struct prestera_port *port,
-					  struct flow_block_offload *f,
-					  bool ingress)
+static int prestera_setup_flow_block_clsact(struct prestera_port *port,
+					    struct flow_block_offload *f,
+					    bool ingress)
 {
 	f->driver_block_list = &prestera_block_cb_list;
 
 	switch (f->command) {
 	case FLOW_BLOCK_BIND:
-		return prestera_setup_tc_block_bind(port, f, ingress);
+		return prestera_setup_flow_block_bind(port, f, ingress);
 	case FLOW_BLOCK_UNBIND:
-		prestera_setup_tc_block_unbind(port, f, ingress);
+		prestera_setup_flow_block_unbind(port, f, ingress);
 		return 0;
 	default:
 		return -EOPNOTSUPP;
 	}
 }
 
-int prestera_setup_tc_block(struct prestera_port *port,
-			    struct flow_block_offload *f)
+int prestera_flow_block_setup(struct prestera_port *port,
+			      struct flow_block_offload *f)
 {
 	switch (f->binder_type) {
 	case FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS:
-		return prestera_setup_tc_block_clsact(port, f, true);
+		return prestera_setup_flow_block_clsact(port, f, true);
 	case FLOW_BLOCK_BINDER_TYPE_CLSACT_EGRESS:
-		return prestera_setup_tc_block_clsact(port, f, false);
+		return prestera_setup_flow_block_clsact(port, f, false);
 	default:
 		return -EOPNOTSUPP;
 	}

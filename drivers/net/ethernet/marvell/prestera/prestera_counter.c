@@ -13,12 +13,12 @@
 struct prestera_counter {
 	struct prestera_switch *sw;
 	struct delayed_work stats_dw;
-	bool is_fetching;
-	u32 total_read;
 	struct mutex mtx;  /* protect block_list */
 	struct prestera_counter_block **block_list;
+	u32 total_read;
 	u32 block_list_len;
 	u32 curr_idx;
+	bool is_fetching;
 };
 
 struct prestera_counter_block {
@@ -28,12 +28,12 @@ struct prestera_counter_block {
 	u32 num_counters;
 	u32 client;
 	struct idr counter_idr;
-	bool full;
-	bool is_updating;
 	refcount_t refcnt;
 	struct mutex mtx;  /* protect stats and counter_idr */
 	struct prestera_counter_stats *stats;
 	u8 *counter_flag;
+	bool is_updating;
+	bool full;
 };
 
 enum {
@@ -138,48 +138,48 @@ static int prestera_counter_block_list_add(struct prestera_counter *counter,
 }
 
 static struct prestera_counter_block *
-prestera_counter_block_get(struct prestera_counter *counter,
-			   u32 client)
+prestera_counter_block_get(struct prestera_counter *counter, u32 client)
 {
 	struct prestera_counter_block *block;
 	int err;
 
 	block = prestera_counter_block_lookup_not_full(counter, client);
-	if (!block) {
-		block = kzalloc(sizeof(*block), GFP_KERNEL);
-		if (!block)
-			return ERR_PTR(-ENOMEM);
+	if (block)
+		return block;
 
-		err = prestera_hw_counter_block_get(counter->sw, client,
-						    &block->id, &block->offset,
-						    &block->num_counters);
-		if (err)
-			goto err_block;
+	block = kzalloc(sizeof(*block), GFP_KERNEL);
+	if (!block)
+		return ERR_PTR(-ENOMEM);
 
-		block->stats = kcalloc(block->num_counters,
-				       sizeof(*block->stats), GFP_KERNEL);
-		if (!block->stats) {
-			err = -ENOMEM;
-			goto err_stats;
-		}
+	err = prestera_hw_counter_block_get(counter->sw, client,
+					    &block->id, &block->offset,
+					    &block->num_counters);
+	if (err)
+		goto err_block;
 
-		block->counter_flag = kcalloc(block->num_counters,
-					      sizeof(*block->counter_flag),
-					      GFP_KERNEL);
-		if (!block->counter_flag) {
-			err = -ENOMEM;
-			goto err_flag;
-		}
-
-		block->client = client;
-		mutex_init(&block->mtx);
-		refcount_set(&block->refcnt, 1);
-		idr_init_base(&block->counter_idr, block->offset);
-
-		err = prestera_counter_block_list_add(counter, block);
-		if (err)
-			goto err_list_add;
+	block->stats = kcalloc(block->num_counters,
+			       sizeof(*block->stats), GFP_KERNEL);
+	if (!block->stats) {
+		err = -ENOMEM;
+		goto err_stats;
 	}
+
+	block->counter_flag = kcalloc(block->num_counters,
+				      sizeof(*block->counter_flag),
+				      GFP_KERNEL);
+	if (!block->counter_flag) {
+		err = -ENOMEM;
+		goto err_flag;
+	}
+
+	block->client = client;
+	mutex_init(&block->mtx);
+	refcount_set(&block->refcnt, 1);
+	idr_init_base(&block->counter_idr, block->offset);
+
+	err = prestera_counter_block_list_add(counter, block);
+	if (err)
+		goto err_list_add;
 
 	return block;
 
