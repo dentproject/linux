@@ -59,7 +59,7 @@ enum mvsw_pr_mp_hash_policy {
 
 struct prestera_kern_neigh_cache_key {
 	struct prestera_ip_addr addr;
-	struct prestera_rif *rif;
+	struct net_device *dev;
 };
 
 struct prestera_kern_neigh_cache {
@@ -211,11 +211,41 @@ mvsw_pr_util_fi2nh_gr_key(struct prestera_switch *sw, struct fib_info *fi,
 			  size_t limit,
 			  struct prestera_nexthop_group_key *grp_key);
 
+static void prestera_kern_fib6_info_hold(struct fib6_info *rt)
+{
+	fib6_info_hold(rt);
+
+	/* Operate only with current sibling, because kernel can disassemble
+	 * siblings list, before release all siblings
+	 */
+	/* if (!rt->fib6_nsiblings)
+	 *	return;
+	 *
+	 * list_for_each_entry(iter, &rt->fib6_siblings, fib6_siblings)
+	 *	fib6_info_hold(iter);
+	 */
+}
+
+static void prestera_kern_fib6_info_release(struct fib6_info *rt)
+{
+	fib6_info_release(rt);
+	/* Operate only with current sibling, because kernel can disassemble
+	 * siblings list, before release all siblings
+	 */
+	/* if (!rt->fib6_nsiblings)
+	 *	return;
+	 *
+	 * list_for_each_entry(iter, &rt->fib6_siblings, fib6_siblings)
+	 *	fib6_info_release(iter);
+	 */
+}
+
 static struct fib_nh_common *
 prestera_kern_fib_info_nhc(struct fib_notifier_info *info, int n)
 {
 	struct fib6_entry_notifier_info *fen6_info;
 	struct fib_entry_notifier_info *fen4_info;
+	struct fib6_info *iter;
 
 	if (info->family == AF_INET) {
 		fen4_info = container_of(info, struct fib_entry_notifier_info,
@@ -224,9 +254,22 @@ prestera_kern_fib_info_nhc(struct fib_notifier_info *info, int n)
 	} else if (info->family == AF_INET6) {
 		fen6_info = container_of(info, struct fib6_entry_notifier_info,
 					 info);
-		return &fen6_info->rt->fib6_nh[n].nh_common;
+		if (!n)
+			return &fen6_info->rt->fib6_nh->nh_common;
+
+		list_for_each_entry(iter, &fen6_info->rt->fib6_siblings,
+				    fib6_siblings) {
+			if (!--n)
+				return &iter->fib6_nh->nh_common;
+		}
 	}
 
+	/* if family is incorrect - than upper functions has BUG */
+	/* if doesn't find requested index - there is alsi bug, because
+	 * valid index must be produced by nhs, which checks list length
+	 */
+	WARN(1, "Invalid parameters passed to %s n=%d i=%p",
+	     __func__, n, info);
 	return NULL;
 }
 
@@ -242,10 +285,8 @@ static int prestera_kern_fib_info_nhs(struct fib_notifier_info *info)
 	} else if (info->family == AF_INET6) {
 		fen6_info = container_of(info, struct fib6_entry_notifier_info,
 					 info);
-		/* TODO: ECMP in ipv6 is several routes.
-		 * Every route has single nh.
-		 */
-		return fen6_info->rt->fib6_nh ? 1 : 0;
+		return fen6_info->rt->fib6_nh ?
+			(fen6_info->rt->fib6_nsiblings + 1) : 0;
 	}
 
 	return 0;
@@ -374,9 +415,12 @@ __mvsw_pr_neigh_iface_init(struct prestera_switch *sw,
 		if (!egress_dev)
 			return -ENOENT;
 
-		if (!prestera_netdev_check(egress_dev))
+		if (!prestera_netdev_check(egress_dev)) {
+			if (egress_dev == dev)
+				return -ENOENT;
 			return __mvsw_pr_neigh_iface_init(sw, iface, n,
 							  egress_dev);
+		}
 
 		port = netdev_priv(egress_dev);
 		iface->dev_port.hw_dev_num = port->dev_id;
@@ -481,10 +525,9 @@ int prestera_util_kern_dip2nh_grp_key(struct prestera_switch *sw,
 				      u32 tb_id, struct prestera_ip_addr *addr,
 				      struct prestera_nexthop_group_key *res)
 {
-	int err;
 	struct fib_result fib_res;
 	struct fib_nh *fib_nh;
-	struct prestera_rif *rif;
+	int err;
 
 	/* TODO: support IPv6 */
 	if (addr->v != PRESTERA_IPV4)
@@ -498,11 +541,7 @@ int prestera_util_kern_dip2nh_grp_key(struct prestera_switch *sw,
 		fib_nh = fib_info_nh(fib_res.fi, 0);
 		memset(res, 0, sizeof(*res));
 		res->neigh[0].addr = *addr;
-		rif = mvsw_pr_rif_find(sw, fib_nh->fib_nh_dev);
-		if (!rif || !rif->is_active)
-			return 0;
-
-		res->neigh[0].rif = rif;
+		res->neigh[0].rif = fib_nh->fib_nh_dev;
 		return 1;
 	}
 
@@ -516,16 +555,16 @@ prestera_util_n_cache_key2nh_key(struct prestera_kern_neigh_cache_key *ck,
 {
 	memset(nk, 0, sizeof(*nk));
 	nk->addr = ck->addr;
-	nk->rif = (void *)ck->rif;
+	nk->rif = (void *)ck->dev;
 }
 
 static bool
 __prestera_util_kern_n_is_reachable_v4(u32 tb_id, __be32 *addr,
 				       struct net_device *dev)
 {
-	bool reachable;
 	struct fib_nh *fib_nh;
 	struct fib_result res;
+	bool reachable;
 
 	reachable = false;
 
@@ -543,9 +582,9 @@ static bool
 __prestera_util_kern_n_is_reachable_v6(u32 tb_id, struct in6_addr *addr,
 				       struct net_device *dev)
 {
-	bool reachable;
 	struct fib_nh_common *nhc;
 	struct fib6_result res;
+	bool reachable;
 
 	reachable = false;
 
@@ -579,8 +618,8 @@ static bool
 prestera_util_fi_is_point2dev(struct fib_notifier_info *info,
 			      const struct net_device *dev)
 {
-	int nhs, i;
 	struct fib_nh_common *nhc;
+	int nhs, i;
 
 	nhs = prestera_kern_fib_info_nhs(info);
 	for (i = 0; i < nhs; i++) {
@@ -597,8 +636,6 @@ prestera_util_nhc2nh_neigh_key(struct prestera_switch *sw,
 			       struct fib_nh_common *nhc,
 			       struct prestera_nh_neigh_key *nh_key)
 {
-	struct prestera_rif *rif;
-
 	memset(nh_key, 0, sizeof(*nh_key));
 	if (nhc->nhc_gw_family == AF_INET) {
 		nh_key->addr.v = PRESTERA_IPV4;
@@ -610,11 +647,7 @@ prestera_util_nhc2nh_neigh_key(struct prestera_switch *sw,
 		return -EOPNOTSUPP;
 	}
 
-	rif = mvsw_pr_rif_find(sw, nhc->nhc_dev);
-	if (!rif || !rif->is_active)
-		return -ENOENT;
-
-	nh_key->rif = rif;
+	nh_key->rif = nhc->nhc_dev;
 	return 0;
 }
 
@@ -633,7 +666,7 @@ prestera_util_fc2nh_gr_key(struct prestera_switch *sw,
 		grp_key->neigh[i].addr =
 			fc->kern_neigh_cache_head[i].n_cache->key.addr;
 		grp_key->neigh[i].rif =
-			fc->kern_neigh_cache_head[i].n_cache->key.rif;
+			fc->kern_neigh_cache_head[i].n_cache->key.dev;
 	}
 
 	return i;
@@ -644,8 +677,8 @@ mvsw_pr_util_fi2nh_gr_key(struct prestera_switch *sw, struct fib_info *fi,
 			  size_t limit,
 			  struct prestera_nexthop_group_key *grp_key)
 {
-	int i, nhs, err;
 	struct fib_nh *fib_nh;
+	int i, nhs, err;
 
 	if (!prestera_fi_is_nh(fi))
 		return 0;
@@ -699,13 +732,10 @@ mvsw_pr_util_fib_cache_key2fib_key(struct mvsw_pr_kern_fib_cache_key *ckey,
 	fkey->tb_id = mvsw_pr_fix_tb_id(ckey->kern_tb_id);
 }
 
-static int
-prestera_util_nhc2n_cache_key(struct prestera_switch *sw,
-			      struct fib_nh_common *nhc,
-			      struct prestera_kern_neigh_cache_key *nk)
+static int prestera_util_nhc2nc_key(struct prestera_switch *sw,
+				    struct fib_nh_common *nhc,
+				    struct prestera_kern_neigh_cache_key *nk)
 {
-	struct prestera_rif *rif;
-
 	memset(nk, 0, sizeof(*nk));
 	if (nhc->nhc_gw_family == AF_INET) {
 		nk->addr.v = PRESTERA_IPV4;
@@ -714,11 +744,8 @@ prestera_util_nhc2n_cache_key(struct prestera_switch *sw,
 		nk->addr.v = PRESTERA_IPV6;
 		nk->addr.u.ipv6 = nhc->nhc_gw.ipv6;
 	}
-	rif = mvsw_pr_rif_find(sw, nhc->nhc_dev);
-	if (!rif || !rif->is_active)
-		return -ENOENT;
 
-	nk->rif = rif;
+	nk->dev = nhc->nhc_dev;
 	return 0;
 }
 
@@ -727,10 +754,10 @@ prestera_util_nhc_eq_n_cache_key(struct prestera_switch *sw,
 				 struct fib_nh_common *nhc,
 				 struct prestera_kern_neigh_cache_key *nk)
 {
-	int err;
 	struct prestera_kern_neigh_cache_key tk;
+	int err;
 
-	err = prestera_util_nhc2n_cache_key(sw, nhc, &tk);
+	err = prestera_util_nhc2nc_key(sw, nhc, &tk);
 	if (err)
 		return false;
 
@@ -740,9 +767,9 @@ prestera_util_nhc_eq_n_cache_key(struct prestera_switch *sw,
 	return true;
 }
 
-static int mvsw_pr_util_neigh2nh_neigh_key(struct prestera_switch *sw,
-					   struct neighbour *n,
-					   struct prestera_nh_neigh_key *key)
+static int
+mvsw_pr_util_neigh2nc_key(struct prestera_switch *sw, struct neighbour *n,
+			  struct prestera_kern_neigh_cache_key *key)
 {
 	memset(key, 0, sizeof(*key));
 	if (n->tbl->family == AF_INET) {
@@ -755,16 +782,14 @@ static int mvsw_pr_util_neigh2nh_neigh_key(struct prestera_switch *sw,
 		return -ENOENT;
 	}
 
-	key->rif = mvsw_pr_rif_find(sw, n->dev);
-	if (!key->rif)
-		return -ENOENT;
+	key->dev = n->dev;
 
 	return 0;
 }
 
 static struct prestera_kern_neigh_cache *
 mvsw_pr_kern_neigh_cache_find(struct prestera_switch *sw,
-			      struct prestera_nh_neigh_key *key)
+			      struct prestera_kern_neigh_cache_key *key)
 {
 	struct prestera_kern_neigh_cache *n_cache;
 
@@ -778,8 +803,7 @@ static void
 __mvsw_pr_kern_neigh_cache_destroy(struct prestera_switch *sw,
 				   struct prestera_kern_neigh_cache *n_cache)
 {
-	n_cache->key.rif->ref_cnt--;
-	prestera_rif_put(sw, n_cache->key.rif);
+	dev_put(n_cache->key.dev);
 	rhashtable_remove_fast(&sw->router->kern_neigh_cache_ht,
 			       &n_cache->ht_node,
 			       __mvsw_pr_kern_neigh_cache_ht_params);
@@ -788,7 +812,7 @@ __mvsw_pr_kern_neigh_cache_destroy(struct prestera_switch *sw,
 
 static struct prestera_kern_neigh_cache *
 __mvsw_pr_kern_neigh_cache_create(struct prestera_switch *sw,
-				  struct prestera_nh_neigh_key *key)
+				  struct prestera_kern_neigh_cache_key *key)
 {
 	struct prestera_kern_neigh_cache *n_cache;
 	int err;
@@ -798,7 +822,7 @@ __mvsw_pr_kern_neigh_cache_create(struct prestera_switch *sw,
 		goto err_kzalloc;
 
 	memcpy(&n_cache->key, key, sizeof(*key));
-	n_cache->key.rif->ref_cnt++;
+	dev_hold(n_cache->key.dev);
 
 	INIT_LIST_HEAD(&n_cache->kern_fib_cache_list);
 	err = rhashtable_insert_fast(&sw->router->kern_neigh_cache_ht,
@@ -810,8 +834,7 @@ __mvsw_pr_kern_neigh_cache_create(struct prestera_switch *sw,
 	return n_cache;
 
 err_ht_insert:
-	n_cache->key.rif->ref_cnt--;
-	prestera_rif_put(sw, n_cache->key.rif);
+	dev_put(n_cache->key.dev);
 	kfree(n_cache);
 err_kzalloc:
 	return NULL;
@@ -819,7 +842,7 @@ err_kzalloc:
 
 static struct prestera_kern_neigh_cache *
 mvsw_pr_kern_neigh_cache_get(struct prestera_switch *sw,
-			     struct prestera_nh_neigh_key *key)
+			     struct prestera_kern_neigh_cache_key *key)
 {
 	struct prestera_kern_neigh_cache *n_cache;
 
@@ -859,8 +882,8 @@ static void
 mvsw_pr_kern_fib_cache_destroy(struct prestera_switch *sw,
 			       struct mvsw_pr_kern_fib_cache *fib_cache)
 {
-	int i;
 	struct prestera_kern_neigh_cache *n_cache;
+	int i;
 
 	for (i = 0; i < PRESTERA_NHGR_SIZE_MAX; i++) {
 		n_cache = fib_cache->kern_neigh_cache_head[i].n_cache;
@@ -873,7 +896,7 @@ mvsw_pr_kern_fib_cache_destroy(struct prestera_switch *sw,
 	if (fib_cache->key.addr.v == PRESTERA_IPV4)
 		fib_info_put(fib_cache->fen4_info.fi);
 	else if (fib_cache->key.addr.v == PRESTERA_IPV6)
-		fib6_info_release(fib_cache->fen6_info.rt);
+		prestera_kern_fib6_info_release(fib_cache->fen6_info.rt);
 
 	rhashtable_remove_fast(&sw->router->kern_fib_cache_ht,
 			       &fib_cache->ht_node,
@@ -882,11 +905,11 @@ mvsw_pr_kern_fib_cache_destroy(struct prestera_switch *sw,
 }
 
 static int
-__prestera_kern_fib_cache_create_nhs4(struct prestera_switch *sw,
-				      struct mvsw_pr_kern_fib_cache *fc)
+__prestera_kern_fib_cache_create_nhs(struct prestera_switch *sw,
+				     struct mvsw_pr_kern_fib_cache *fc)
 {
+	struct prestera_kern_neigh_cache_key nc_key;
 	struct prestera_kern_neigh_cache *n_cache;
-	struct prestera_nh_neigh_key nh_key;
 	struct fib_nh_common *nhc;
 	int i, nhs, err;
 
@@ -899,47 +922,11 @@ __prestera_kern_fib_cache_create_nhs4(struct prestera_switch *sw,
 
 	for (i = 0; i < nhs; i++) {
 		nhc = prestera_kern_fib_info_nhc(&fc->fen4_info.info, i);
-		err = prestera_util_nhc2nh_neigh_key(sw, nhc, &nh_key);
+		err = prestera_util_nhc2nc_key(sw, nhc, &nc_key);
 		if (err)
 			return 0;
 
-		n_cache = mvsw_pr_kern_neigh_cache_get(sw, &nh_key);
-		if (!n_cache)
-			return 0;
-
-		fc->kern_neigh_cache_head[i].this = fc;
-		fc->kern_neigh_cache_head[i].n_cache = n_cache;
-		list_add(&fc->kern_neigh_cache_head[i].head,
-			 &n_cache->kern_fib_cache_list);
-	}
-
-	return 0;
-}
-
-static int
-__prestera_kern_fib_cache_create_nhs6(struct prestera_switch *sw,
-				      struct mvsw_pr_kern_fib_cache *fc)
-{
-	struct prestera_kern_neigh_cache *n_cache;
-	struct fib6_info *fi = fc->fen6_info.rt;
-	struct prestera_nh_neigh_key nh_key;
-	struct fib_nh_common *nhc;
-	int i, nhs, err;
-
-	if (!prestera_fi6_is_nh(fi))
-		return 0;
-
-	nhs = prestera_kern_fib_info_nhs(&fc->fen6_info.info);
-	if (nhs > PRESTERA_NHGR_SIZE_MAX)
-		return 0;
-
-	for (i = 0; i < nhs; i++) {
-		nhc = &fi->fib6_nh[i].nh_common;
-		err = prestera_util_nhc2nh_neigh_key(sw, nhc, &nh_key);
-		if (err)
-			return 0;
-
-		n_cache = mvsw_pr_kern_neigh_cache_get(sw, &nh_key);
+		n_cache = mvsw_pr_kern_neigh_cache_get(sw, &nc_key);
 		if (!n_cache)
 			return 0;
 
@@ -992,7 +979,7 @@ prestera_kern_fib_cache_create(struct prestera_switch *sw,
 		fib_info_hold(fen_info->fi);
 		memcpy(&fib_cache->fen4_info, fen_info, sizeof(*fen_info));
 	} else {
-		fib6_info_hold(fen6_info->rt);
+		prestera_kern_fib6_info_hold(fen6_info->rt);
 		memcpy(&fib_cache->fen6_info, fen6_info, sizeof(*fen6_info));
 	}
 
@@ -1003,11 +990,7 @@ prestera_kern_fib_cache_create(struct prestera_switch *sw,
 		goto err_ht_insert;
 
 	/* Handle nexthops */
-	if (key->addr.v == PRESTERA_IPV4)
-		err = __prestera_kern_fib_cache_create_nhs4(sw, fib_cache);
-	else
-		err = __prestera_kern_fib_cache_create_nhs6(sw, fib_cache);
-
+	err = __prestera_kern_fib_cache_create_nhs(sw, fib_cache);
 	if (err)
 		goto out; /* Not critical */
 
@@ -1016,9 +999,9 @@ out:
 
 err_ht_insert:
 	if (key->addr.v == PRESTERA_IPV4)
-		fib_info_hold(fen_info->fi);
+		fib_info_put(fen_info->fi);
 	else
-		fib6_info_release(fen6_info->rt);
+		prestera_kern_fib6_info_release(fen6_info->rt);
 
 	kfree(fib_cache);
 err_kzalloc:
@@ -1031,8 +1014,8 @@ __prestera_k_arb_fib_nh_offload_set(struct prestera_switch *sw,
 				    struct prestera_kern_neigh_cache *nc,
 				    bool offloaded, bool trap)
 {
-	int i, nhs;
 	struct fib_nh_common *nhc;
+	int i, nhs;
 
 	nhs = prestera_kern_fib_info_nhs(&fibc->info);
 	for (i = 0; i < nhs; i++) {
@@ -1087,10 +1070,10 @@ __mvsw_pr_k_arb_n_offload_set(struct prestera_switch *sw,
 
 	if (nc->key.addr.v == PRESTERA_IPV4)
 		n = neigh_lookup(&arp_tbl, &nc->key.addr.u.ipv4,
-				 nc->key.rif->dev);
+				 nc->key.dev);
 	else if (nc->key.addr.v == PRESTERA_IPV6)
 		n = neigh_lookup(&nd_tbl, &nc->key.addr.u.ipv6,
-				 nc->key.rif->dev);
+				 nc->key.dev);
 	else
 		n = NULL;
 
@@ -1106,11 +1089,11 @@ __mvsw_pr_k_arb_n_lpm_set(struct prestera_switch *sw,
 			  struct prestera_kern_neigh_cache *n_cache,
 			  bool enabled)
 {
+	struct prestera_nexthop_group_key nh_grp_key;
 	struct mvsw_pr_kern_fib_cache_key fc_key;
 	struct mvsw_pr_kern_fib_cache *fib_cache;
-	struct prestera_fib_key fib_key;
 	struct prestera_fib_node *fib_node;
-	struct prestera_nexthop_group_key nh_grp_key;
+	struct prestera_fib_key fib_key;
 
 	/* Exception for fc with prefix 32: LPM entry is already used by fib */
 	memset(&fc_key, 0, sizeof(fc_key));
@@ -1119,14 +1102,16 @@ __mvsw_pr_k_arb_n_lpm_set(struct prestera_switch *sw,
 	/* But better to use tb_id of route, which pointed to this neighbour. */
 	/* We take it from rif, because rif inconsistent.
 	 * Must be separated in_rif and out_rif.
+	 * Also note: for each fib pointed to this neigh should be separated
+	 *            neigh lpm entry (for each ingress vr)
 	 */
-	fc_key.kern_tb_id = n_cache->key.rif->kern_tb_id;
+	fc_key.kern_tb_id = l3mdev_fib_table(n_cache->key.dev);
 	fib_cache = mvsw_pr_kern_fib_cache_find(sw, &fc_key);
 	if (!fib_cache || !fib_cache->reachable) {
 		memset(&fib_key, 0, sizeof(fib_key));
 		fib_key.addr = n_cache->key.addr;
 		fib_key.prefix_len = PRESTERA_IP_ADDR_PLEN(n_cache->key.addr.v);
-		fib_key.tb_id = mvsw_pr_fix_tb_id(n_cache->key.rif->kern_tb_id);
+		fib_key.tb_id = mvsw_pr_fix_tb_id(fc_key.kern_tb_id);
 		fib_node = prestera_fib_node_find(sw, &fib_key);
 		if (!enabled && fib_node) {
 			if (mvsw_pr_fib_node_util_is_neighbour(fib_node))
@@ -1154,9 +1139,8 @@ static void
 __mvsw_pr_k_arb_nc_kern_fib_fetch(struct prestera_switch *sw,
 				  struct prestera_kern_neigh_cache *nc)
 {
-	if (prestera_util_kern_n_is_reachable(nc->key.rif->kern_tb_id,
-					      &nc->key.addr,
-					      nc->key.rif->dev))
+	if (prestera_util_kern_n_is_reachable(l3mdev_fib_table(nc->key.dev),
+					      &nc->key.addr, nc->key.dev))
 		nc->reachable = true;
 	else
 		nc->reachable = false;
@@ -1168,16 +1152,15 @@ __mvsw_pr_k_arb_nc_kern_n_fetch(struct prestera_switch *sw,
 				struct prestera_kern_neigh_cache *nc)
 {
 	struct neighbour *n;
-	struct prestera_rif_entry *re;
 	int err;
 
 	memset(&nc->nh_neigh_info, 0, sizeof(nc->nh_neigh_info));
 	if (nc->key.addr.v == PRESTERA_IPV4)
 		n = neigh_lookup(&arp_tbl, &nc->key.addr.u.ipv4,
-				 nc->key.rif->dev);
+				 nc->key.dev);
 	else if (nc->key.addr.v == PRESTERA_IPV6)
 		n = neigh_lookup(&nd_tbl, &nc->key.addr.u.ipv6,
-				 nc->key.rif->dev);
+				 nc->key.dev);
 	else
 		n = NULL;
 
@@ -1187,22 +1170,7 @@ __mvsw_pr_k_arb_nc_kern_n_fetch(struct prestera_switch *sw,
 	read_lock_bh(&n->lock);
 	if (n->nud_state & NUD_VALID && !n->dead) {
 		err = mvsw_pr_neigh_iface_init(sw, &nc->nh_neigh_info.iface, n);
-		if (err) {
-			/* TODO: message for ipv6 */
-			MVSW_LOG_ERROR("Cannot initialize iface for %pI4n %pM",
-				       n->primary_key, &n->ha[0]);
-			goto n_read_out;
-		}
-		/* This line is dirty.
-		 * We add it, because there is vlan, wich mapped by vr_id.
-		 * But this is incorrect. Because nh is pointed to vlan, not vr!
-		 * If kernel will manage routing vlans - this will be more
-		 * logicaly.
-		 */
-		re = prestera_rif_entry_find(sw, &nc->key.rif->rif_entry_key);
-		if (re)
-			nc->nh_neigh_info.iface.vr_id = re->vr->hw_vr_id;
-		else
+		if (err)
 			goto n_read_out;
 
 		memcpy(&nc->nh_neigh_info.ha[0], &n->ha[0], ETH_ALEN);
@@ -1221,23 +1189,21 @@ static void
 __mvsw_pr_k_arb_nc_apply(struct prestera_switch *sw,
 			 struct prestera_kern_neigh_cache *nc)
 {
-	struct prestera_nh_neigh_key nh_key;
-	struct prestera_nh_neigh *nh_neigh;
 	struct mvsw_pr_kern_neigh_cache_head *nhead;
 	struct prestera_acl_nat_port *nat_port;
-	struct prestera_port *port;
+	struct prestera_nh_neigh_key nh_key;
+	struct prestera_nh_neigh *nh_neigh;
 	u32 port_hw_id, port_dev_id;
+	struct prestera_port *port;
 	int err;
 
-	__mvsw_pr_k_arb_n_lpm_set(sw, nc,
-				  nc->reachable && nc->in_kernel);
-	__mvsw_pr_k_arb_n_offload_set(sw, nc,
-				      nc->reachable && nc->in_kernel);
+	__mvsw_pr_k_arb_n_lpm_set(sw, nc, nc->reachable && nc->in_kernel);
+	__mvsw_pr_k_arb_n_offload_set(sw, nc, nc->reachable && nc->in_kernel);
 
 	/* update NAT port on neighbour change */
 	/* Note: should be no such lines here. It's iincorrect static NAT. */
-	port_hw_id = nc->key.rif->rif_entry_key.iface.dev_port.port_num;
-	port_dev_id = nc->key.rif->rif_entry_key.iface.dev_port.hw_dev_num;
+	port_hw_id = nc->nh_neigh_info.iface.dev_port.port_num;
+	port_dev_id = nc->nh_neigh_info.iface.dev_port.hw_dev_num;
 	nat_port = prestera_acl_nat_port_get(sw->acl, port_hw_id,
 					     port_dev_id);
 	if (!nat_port)
@@ -1286,10 +1252,10 @@ out:
 static void __mvsw_pr_k_arb_hw_state_upd(struct prestera_switch *sw,
 					 struct prestera_kern_neigh_cache *nc)
 {
-	bool hw_active;
 	struct prestera_nh_neigh_key nh_key;
 	struct prestera_nh_neigh *nh_neigh;
 	struct neighbour *n;
+	bool hw_active;
 
 	prestera_util_n_cache_key2nh_key(&nc->key, &nh_key);
 	nh_neigh = prestera_nh_neigh_find(sw, &nh_key);
@@ -1311,16 +1277,16 @@ static void __mvsw_pr_k_arb_hw_state_upd(struct prestera_switch *sw,
 
 	if (nc->key.addr.v == PRESTERA_IPV4) {
 		n = neigh_lookup(&arp_tbl, &nc->key.addr.u.ipv4,
-				 nc->key.rif->dev);
+				 nc->key.dev);
 		if (!n)
 			n = neigh_create(&arp_tbl, &nc->key.addr.u.ipv4,
-					 nc->key.rif->dev);
+					 nc->key.dev);
 	} else if (nc->key.addr.v == PRESTERA_IPV6) {
 		n = neigh_lookup(&nd_tbl, &nc->key.addr.u.ipv6,
-				 nc->key.rif->dev);
+				 nc->key.dev);
 		if (!n)
 			n = neigh_create(&nd_tbl, &nc->key.addr.u.ipv6,
-					 nc->key.rif->dev);
+					 nc->key.dev);
 	} else {
 		n = NULL;
 	}
@@ -1368,9 +1334,8 @@ static int
 __prestera_pr_k_arb_fc_lpm_info_calc(struct prestera_switch *sw,
 				     struct mvsw_pr_kern_fib_cache *fc)
 {
-	int nh_cnt;
-	struct prestera_rif *rif;
 	struct fib_nh_common *nhc;
+	int nh_cnt;
 
 	memset(&fc->lpm_info, 0, sizeof(fc->lpm_info));
 
@@ -1387,16 +1352,11 @@ __prestera_pr_k_arb_fc_lpm_info_calc(struct prestera_switch *sw,
 			 * as nexthop of this route.
 			 */
 			nhc = prestera_kern_fib_info_nhc(&fc->info, 0);
-			rif = mvsw_pr_rif_find(sw, nhc->nhc_dev);
-			/* If we realy can access this route via HW */
-			if (!rif || !rif->is_active) {
-				fc->lpm_info.fib_type = PRESTERA_FIB_TYPE_TRAP;
-			} else {
-				fc->lpm_info.fib_type = PRESTERA_FIB_TYPE_UC_NH;
-				fc->lpm_info.nh_grp_key.neigh[0].addr =
-					fc->key.addr;
-				fc->lpm_info.nh_grp_key.neigh[0].rif = rif;
-			}
+			fc->lpm_info.fib_type = PRESTERA_FIB_TYPE_UC_NH;
+			fc->lpm_info.nh_grp_key.neigh[0].addr =
+				fc->key.addr;
+			fc->lpm_info.nh_grp_key.neigh[0].rif =
+				nhc->nhc_dev;
 
 			break;
 		}
@@ -1474,8 +1434,8 @@ static struct mvsw_pr_kern_fib_cache *
 __mvsw_pr_k_arb_util_fib_overlaps(struct prestera_switch *sw,
 				  struct mvsw_pr_kern_fib_cache *fc)
 {
-	struct mvsw_pr_kern_fib_cache *rfc;
 	struct mvsw_pr_kern_fib_cache_key fc_key;
+	struct mvsw_pr_kern_fib_cache *rfc;
 
 	/* TODO: parse kernel rules */
 	rfc = NULL;
@@ -1492,8 +1452,8 @@ static struct mvsw_pr_kern_fib_cache *
 __mvsw_pr_k_arb_util_fib_overlapped(struct prestera_switch *sw,
 				    struct mvsw_pr_kern_fib_cache *fc)
 {
-	struct mvsw_pr_kern_fib_cache *rfc;
 	struct mvsw_pr_kern_fib_cache_key fc_key;
+	struct mvsw_pr_kern_fib_cache *rfc;
 
 	/* TODO: parse kernel rules */
 	rfc = NULL;
@@ -1594,11 +1554,11 @@ static void prestera_k_arb_flush(struct prestera_switch *sw)
  */
 void prestera_k_arb_fdb_evt(struct prestera_switch *sw, struct net_device *dev)
 {
+	struct prestera_kern_neigh_cache *n_cache;
 	struct net_device *upper_dev;
 	struct list_head *list_iter;
-	struct prestera_rif *rif;
-	struct prestera_kern_neigh_cache *n_cache;
 	struct rhashtable_iter iter;
+	struct prestera_rif *rif;
 
 	rif = mvsw_pr_rif_find(sw, dev);
 	if (rif) {
@@ -1616,7 +1576,7 @@ void prestera_k_arb_fdb_evt(struct prestera_switch *sw, struct net_device *dev)
 			if (IS_ERR(n_cache))
 				continue;
 
-			if (n_cache->key.rif != rif)
+			if (n_cache->key.dev != rif->dev)
 				continue;
 
 			rhashtable_walk_stop(&iter);
@@ -1636,11 +1596,11 @@ void prestera_k_arb_fdb_evt(struct prestera_switch *sw, struct net_device *dev)
 static void mvsw_pr_k_arb_n_evt(struct prestera_switch *sw,
 				struct neighbour *n)
 {
+	struct prestera_kern_neigh_cache_key n_key;
 	struct prestera_kern_neigh_cache *n_cache;
-	struct prestera_nh_neigh_key n_key;
 	int err;
 
-	err = mvsw_pr_util_neigh2nh_neigh_key(sw, n, &n_key);
+	err = mvsw_pr_util_neigh2nc_key(sw, n, &n_key);
 	if (err)
 		return;
 
@@ -1714,9 +1674,9 @@ mvsw_pr_k_arb_fib_evt(struct prestera_switch *sw,
 		      bool replace, /* replace or del */
 		      struct fib_notifier_info *info)
 {
+	struct mvsw_pr_kern_fib_cache *tfib_cache, *bfib_cache;
 	struct mvsw_pr_kern_fib_cache_key fc_key;
 	struct mvsw_pr_kern_fib_cache *fib_cache;
-	struct mvsw_pr_kern_fib_cache *tfib_cache, *bfib_cache;
 	int err;
 
 	prestera_util_fen_info2fib_cache_key(info, &fc_key);
@@ -1773,11 +1733,11 @@ static void mvsw_pr_k_arb_nh_evt(struct prestera_switch *sw,
 				 bool replace,
 				 struct fib_nh *fib_nh)
 {
+	struct prestera_kern_neigh_cache_key nkey;
 	struct prestera_kern_neigh_cache *nc;
-	struct prestera_nh_neigh_key nkey;
 	int err;
 
-	err = prestera_util_nhc2nh_neigh_key(sw, &fib_nh->nh_common, &nkey);
+	err = prestera_util_nhc2nc_key(sw, &fib_nh->nh_common, &nkey);
 	if (err)
 		return;
 
@@ -1799,9 +1759,9 @@ __mvsw_pr_k_arb_fc_rebuild(struct prestera_switch *sw,
 {
 	struct fib6_entry_notifier_info fen6_info;
 	struct fib_entry_notifier_info fen4_info;
-	struct fib_notifier_info *info;
 	struct mvsw_pr_kern_fib_cache_key key;
 	struct mvsw_pr_kern_fib_cache *new_fc;
+	struct fib_notifier_info *info;
 	bool reachable;
 
 	memcpy(&key, &fc->key, sizeof(key));
@@ -1811,7 +1771,7 @@ __mvsw_pr_k_arb_fc_rebuild(struct prestera_switch *sw,
 		info = &fen4_info.info;
 	} else if (key.addr.v == PRESTERA_IPV6) {
 		memcpy(&fen6_info, &fc->fen6_info, sizeof(fen6_info));
-		fib6_info_hold(fen6_info.rt);
+		prestera_kern_fib6_info_hold(fen6_info.rt);
 		info = &fen6_info.info;
 	} else {
 		return NULL;
@@ -1826,7 +1786,7 @@ __mvsw_pr_k_arb_fc_rebuild(struct prestera_switch *sw,
 	if (key.addr.v == PRESTERA_IPV4)
 		fib_info_put(fen4_info.fi);
 	else if (key.addr.v == PRESTERA_IPV6)
-		fib6_info_release(fen6_info.rt);
+		prestera_kern_fib6_info_release(fen6_info.rt);
 
 	if (!new_fc)
 		return NULL;
@@ -1884,7 +1844,7 @@ static void mvsw_pr_k_arb_rif_evt(struct prestera_switch *sw,
 		if (IS_ERR(nc))
 			continue;
 
-		if (nc->key.rif == rif) {
+		if (nc->key.dev == rif->dev) {
 			nc_lnode = kzalloc(sizeof(*nc_lnode), GFP_ATOMIC);
 			if (WARN_ON(!nc_lnode))
 				break;
@@ -1901,7 +1861,7 @@ static void mvsw_pr_k_arb_rif_evt(struct prestera_switch *sw,
 
 		nc_lnode->nc->in_kernel = false;
 		__mvsw_pr_k_arb_nc_apply(sw, nc_lnode->nc);
-		WARN_ON(mvsw_pr_kern_neigh_cache_put(sw, nc_lnode->nc));
+		mvsw_pr_kern_neigh_cache_put(sw, nc_lnode->nc);
 
 		list_del(&nc_lnode->head);
 		kfree(nc_lnode);
@@ -1936,7 +1896,6 @@ static int mvsw_pr_router_netevent_event(struct notifier_block *nb,
 {
 	struct mvsw_pr_netevent_work *net_work;
 	struct prestera_router *router;
-	struct prestera_rif *rif;
 	struct neighbour *n = ptr;
 
 	router = container_of(nb, struct prestera_router, netevent_nb);
@@ -1944,10 +1903,6 @@ static int mvsw_pr_router_netevent_event(struct notifier_block *nb,
 	switch (event) {
 	case NETEVENT_NEIGH_UPDATE:
 		if (n->tbl->family != AF_INET && n->tbl->family != AF_INET6)
-			return NOTIFY_DONE;
-
-		rif = mvsw_pr_rif_find(router->sw, n->dev);
-		if (!rif)
 			return NOTIFY_DONE;
 
 		net_work = kzalloc(sizeof(*net_work), GFP_ATOMIC);
@@ -2122,8 +2077,8 @@ static int mvsw_pr_rif_macvlan_add(struct prestera_switch *sw,
 				   struct netlink_ext_ack *extack)
 {
 	struct macvlan_dev *vlan = netdev_priv(macvlan_dev);
-	struct prestera_rif *rif;
 	struct prestera_rif_entry *re;
+	struct prestera_rif *rif;
 	int err;
 
 	rif = mvsw_pr_rif_find(sw, vlan->lowerdev);
@@ -2149,8 +2104,8 @@ static void __mvsw_pr_rif_macvlan_del(struct prestera_switch *sw,
 				      const struct net_device *macvlan_dev)
 {
 	struct macvlan_dev *vlan = netdev_priv(macvlan_dev);
-	struct prestera_rif *rif;
 	struct prestera_rif_entry *re;
+	struct prestera_rif *rif;
 
 	rif = mvsw_pr_rif_find(sw, vlan->lowerdev);
 	if (!rif)
@@ -2362,8 +2317,8 @@ mvsw_pr_rif_should_config(struct prestera_rif *rif, struct net_device *dev,
 			  unsigned long event)
 {
 	bool addr_list_empty = true;
-	struct in_device *idev;
 	struct inet6_dev *i6dev;
+	struct in_device *idev;
 
 	switch (event) {
 	case NETDEV_UP:
@@ -2455,10 +2410,10 @@ out:
 static int prestera_inet6addr_event(struct notifier_block *nb,
 				    unsigned long event, void *ptr)
 {
-	struct inet6_ifaddr *ifa = (struct inet6_ifaddr *)ptr;
-	struct net_device *dev = ifa->idev->dev;
 	struct prestera_router *router =
 		container_of(nb, struct prestera_router, inet6addr_nb);
+	struct inet6_ifaddr *ifa = (struct inet6_ifaddr *)ptr;
+	struct net_device *dev = ifa->idev->dev;
 	struct prestera_rif *rif;
 	int err = 0;
 
@@ -2484,12 +2439,22 @@ out:
 static int prestera_inet6addr_valid_event(struct notifier_block *nb,
 					  unsigned long event, void *ptr)
 {
-	struct in6_validator_info *ivi = (struct in6_validator_info *)ptr;
-	struct net_device *dev = ivi->i6vi_dev->dev;
 	struct prestera_router *router =
 		container_of(nb, struct prestera_router, inet6addr_valid_nb);
+	struct in6_validator_info *ivi = (struct in6_validator_info *)ptr;
+	struct net_device *dev = ivi->i6vi_dev->dev;
 	struct prestera_rif *rif;
 	int err = 0;
+
+	/* This fetch of sw is not necessary, as we can get router->sw
+	 * (from  notifier block). But it used to detect if there are lower
+	 * devices (in case of bridge). So, if there are no lower devices -
+	 * we must ignore bridge UP event, because otherwise check_rif_addr
+	 * failed and this will block configuration addresses for bridges,
+	 * that has no our interfaces enslaved.
+	 */
+	if (!prestera_switch_get(dev))
+		goto out;
 
 	rif = mvsw_pr_rif_find(router->sw, dev);
 	if (!mvsw_pr_rif_should_config(rif, dev, event))
@@ -2511,7 +2476,7 @@ static bool __prestera_fi_is_direct(struct fib_info *fi)
 
 	if (fib_info_num_path(fi) == 1) {
 		fib_nh = fib_info_nh(fi, 0);
-		if (fib_nh->fib_nh_scope == RT_SCOPE_HOST)
+		if (fib_nh->fib_nh_gw_family == AF_UNSPEC)
 			return true;
 	}
 
@@ -2697,7 +2662,7 @@ err_out:
 		&fib_work->fen_info.rt->fib6_dst.addr,
 		fib_work->fen_info.rt->fib6_dst.plen);
 out:
-	fib6_info_release(fib_work->fen_info.rt);
+	prestera_kern_fib6_info_release(fib_work->fen_info.rt);
 	mvsw_owq_unlock();
 	kfree(fib_work);
 }
@@ -2706,8 +2671,8 @@ static void mvsw_pr_router_nh_update_event_work(struct work_struct *work)
 {
 	struct prestera_fib_event_work *fib_work =
 			container_of(work, struct prestera_fib_event_work, work);
-	struct prestera_switch *sw = fib_work->sw;
 	struct fib_nh *fib_nh = fib_work->fnh_info.fib_nh;
+	struct prestera_switch *sw = fib_work->sw;
 
 	mvsw_owq_lock();
 
@@ -2767,7 +2732,7 @@ __prestera_router_fib6_event(struct prestera_switch *sw, unsigned long event,
 	if (WARN_ON(!fib_work))
 		return NOTIFY_BAD;
 
-	fib6_info_hold(fen_info->rt);
+	prestera_kern_fib6_info_hold(fen_info->rt);
 	fib_work->fen_info = *fen_info;
 	fib_work->event = event;
 	fib_work->sw = sw;
@@ -3008,6 +2973,10 @@ int prestera_router_init(struct prestera_switch *sw)
 
 	INIT_LIST_HEAD(&sw->router->rif_list);
 
+	err = prestera_l2tun_init(sw);
+	if (err)
+		goto err_l2tun_init;
+
 	mvsw_r_wq = alloc_workqueue(mvsw_driver_name, 0, 0);
 	if (!mvsw_r_wq) {
 		err = -ENOMEM;
@@ -3067,6 +3036,8 @@ err_register_inetaddr_validator_notifier:
 err_alloc_oworkqueue:
 	destroy_workqueue(mvsw_r_wq);
 err_alloc_workqueue:
+	prestera_l2tun_fini(sw);
+err_l2tun_init:
 	rhashtable_destroy(&router->kern_neigh_cache_ht);
 err_kern_neigh_cache_ht_init:
 	rhashtable_destroy(&router->kern_fib_cache_ht);
@@ -3117,6 +3088,7 @@ void prestera_router_fini(struct prestera_switch *sw)
 	/* TODO: check if vrs necessary ? */
 	prestera_k_arb_flush(sw);
 	mvsw_pr_rifs_fini(sw);
+	prestera_l2tun_fini(sw);
 	rhashtable_destroy(&sw->router->kern_neigh_cache_ht);
 	rhashtable_destroy(&sw->router->kern_fib_cache_ht);
 	WARN_ON(!list_empty(&sw->router->rif_list));
@@ -3143,8 +3115,8 @@ static int
 __prestera_rif_macvlan_offload_cb(struct net_device *dev,
 				  struct netdev_nested_priv *priv)
 {
-	struct prestera_rif_entry *re = priv->data;
 	struct prestera_switch *sw = prestera_switch_get(dev);
+	struct prestera_rif_entry *re = priv->data;
 
 	if (!netif_is_macvlan(dev))
 		return 0;
@@ -3155,8 +3127,8 @@ __prestera_rif_macvlan_offload_cb(struct net_device *dev,
 static int __prestera_rif_offload(struct prestera_switch *sw, bool replace,
 				  struct prestera_rif *rif)
 {
-	struct prestera_rif_entry *re;
 	struct netdev_nested_priv priv;
+	struct prestera_rif_entry *re;
 
 	re = prestera_rif_entry_find(sw, &rif->rif_entry_key);
 	if (re)

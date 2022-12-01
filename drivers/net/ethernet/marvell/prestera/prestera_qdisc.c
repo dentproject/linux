@@ -581,6 +581,10 @@ static int __prestera_setup_tc_tbf(struct prestera_port *port,
 	if (!qdisc)
 		return -EOPNOTSUPP;
 
+	/* tbf as root is not supported */
+	if (qdisc == &port->qdisc->root_qdisc)
+		return -EOPNOTSUPP;
+
 	if (p->command == TC_TBF_REPLACE)
 		return prestera_qdisc_replace(port, p->handle, qdisc,
 					      &prestera_qdisc_tbf_ops,
@@ -627,6 +631,10 @@ static int __prestera_setup_tc_red(struct prestera_port *port,
 
 	qdisc = prestera_qdisc_find(port, p->parent);
 	if (!qdisc)
+		return -EOPNOTSUPP;
+
+	/* red as root is not supported */
+	if (qdisc == &port->qdisc->root_qdisc)
 		return -EOPNOTSUPP;
 
 	if (p->command == TC_RED_REPLACE)

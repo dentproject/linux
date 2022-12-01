@@ -65,9 +65,9 @@ struct prestera_fw_regs {
 #define prestera_fw_write(fw, reg, val)	writel(val, (fw)->hw_regs + (reg))
 #define prestera_fw_read(fw, reg)	readl((fw)->hw_regs + (reg))
 
-#define PRESTERA_SUPP_FW_MAJ_VER	3
-#define PRESTERA_SUPP_FW_MIN_VER	2
-#define PRESTERA_SUPP_FW_PATCH_VER	2
+#define PRESTERA_SUPP_FW_MAJ_VER	4
+#define PRESTERA_SUPP_FW_MIN_VER	0
+#define PRESTERA_SUPP_FW_PATCH_VER	0
 
 struct prestera_fw_evtq {
 	u8 __iomem *addr;

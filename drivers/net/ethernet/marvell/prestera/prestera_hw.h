@@ -234,11 +234,17 @@ enum {
 	PRESTERA_SCT_MAX
 };
 
+enum {
+	PRESTERA_POLICER_TYPE_INGRESS,
+	PRESTERA_POLICER_TYPE_EGRESS
+};
+
 struct prestera_switch;
 struct prestera_port;
 struct prestera_port_stats;
 struct prestera_port_caps;
 struct prestera_acl_rule;
+struct prestera_acl_hw_action_info;
 
 struct prestera_iface;
 struct prestera_neigh_info;
@@ -274,6 +280,8 @@ int prestera_hw_port_srcid_default_set(const struct prestera_port *port,
 				       u32 sourceid);
 int prestera_hw_port_srcid_filter_set(const struct prestera_port *port,
 				      u32 sourceid);
+int prestera_hw_port_br_locked_set(const struct prestera_port *port,
+				   bool br_locked);
 int prestera_hw_port_cap_get(const struct prestera_port *port,
 			     struct prestera_port_caps *caps);
 int prestera_hw_port_type_get(const struct prestera_port *port, u8 *type);
@@ -299,6 +307,8 @@ int prestera_hw_port_storm_control_cfg_set(const struct prestera_port *port,
 /* Vlan API */
 int prestera_hw_vlan_create(const struct prestera_switch *sw, u16 vid);
 int prestera_hw_vlan_delete(const struct prestera_switch *sw, u16 vid);
+int prestera_hw_vlan_flood_domain_set(const struct prestera_switch *sw, u16 vid,
+				      u32 flood_domain_idx);
 int prestera_hw_vlan_port_set(const struct prestera_port *port,
 			      u16 vid, bool is_member, bool untagged);
 int prestera_hw_vlan_port_vid_set(const struct prestera_port *port, u16 vid);
@@ -308,6 +318,12 @@ int prestera_hw_fdb_add(const struct prestera_port *port,
 			const unsigned char *mac, u16 vid, bool dynamic);
 int prestera_hw_fdb_del(const struct prestera_port *port,
 			const unsigned char *mac, u16 vid);
+int prestera_hw_fdb_tep_add(struct prestera_switch *sw, u32 tep_id,
+			    const unsigned char *mac, u16 vid, bool dynamic);
+int prestera_hw_fdb_tep_del(struct prestera_switch *sw, u32 tep_id,
+			    const unsigned char *mac, u16 vid);
+int prestera_hw_fdb_flush_tep(const struct prestera_switch *sw, u32 tep_id,
+			      u32 mode);
 int prestera_hw_fdb_flush_port(const struct prestera_port *port, u32 mode);
 int prestera_hw_fdb_flush_vlan(const struct prestera_switch *sw, u16 vid,
 			       u32 mode);
@@ -331,6 +347,10 @@ int prestera_hw_bridge_port_add(const struct prestera_port *port,
 				u16 bridge_id);
 int prestera_hw_bridge_port_delete(const struct prestera_port *port,
 				   u16 bridge_id);
+int prestera_hw_bridge_tep_add(struct prestera_switch *sw, u32 tep_id,
+			       u16 bridge_id);
+int prestera_hw_bridge_tep_delete(struct prestera_switch *sw, u32 tep_id,
+				  u16 bridge_id);
 
 /* STP API */
 int prestera_hw_port_vid_stp_set(struct prestera_port *port, u16 vid, u8 state);
@@ -382,9 +402,26 @@ int prestera_hw_nh_mangle_get(const struct prestera_switch *sw, u32 nh_id,
 
 /* SPAN API */
 int prestera_hw_span_get(const struct prestera_port *port, u8 *span_id);
-int prestera_hw_span_bind(const struct prestera_port *port, u8 span_id);
-int prestera_hw_span_unbind(const struct prestera_port *port);
+int prestera_hw_span_bind(const struct prestera_port *port, u8 span_id,
+			  bool ingress);
+int prestera_hw_span_unbind(const struct prestera_port *port, bool ingress);
 int prestera_hw_span_release(const struct prestera_switch *sw, u8 span_id);
+
+/* L2TUN API */
+int prestera_hw_l2tun_tep_create(const struct prestera_switch *sw, u32 *tep_id);
+int prestera_hw_l2tun_tep_del(const struct prestera_switch *sw, u32 tep_id);
+int prestera_hw_l2tun_tep_set(const struct prestera_switch *sw, u32 tep_id,
+			      struct prestera_neigh_info nh,
+			      __be32 dst_ip, __be32 src_ip,
+			      u16 dst_port, u16 src_port, u32 vni,
+			      u32 source_id);
+int prestera_hw_l2tun_tep_clear(const struct prestera_switch *sw, u32 tep_id);
+int prestera_hw_l2tun_tt_create(const struct prestera_switch *sw,
+				__be32 match_ip,
+				bool match_ip_src_valid, __be32 match_ip_src,
+				u16 match_udp, u32 match_vni, u32 tep_id,
+				u16 pvid, u32 source_id, u32 *tt_id);
+int prestera_hw_l2tun_tt_del(const struct prestera_switch *sw, u32 tt_id);
 
 /* Router API */
 int prestera_hw_rif_create(const struct prestera_switch *sw,
@@ -519,5 +556,13 @@ prestera_hw_sct_ratelimit_set(const struct prestera_switch *sw, u8 group,
 int
 prestera_hw_sct_ratelimit_get(const struct prestera_switch *sw, u8 group,
 			      u32 *rate);
+
+/* Policer API */
+int prestera_hw_policer_create(const struct prestera_switch *sw, u8 type,
+			       u32 *policer_id);
+int prestera_hw_policer_release(const struct prestera_switch *sw,
+				u32 policer_id);
+int prestera_hw_policer_sr_tcm_set(const struct prestera_switch *sw,
+				   u32 policer_id, u64 cir, u32 cbs);
 
 #endif /* _PRESTERA_HW_H_ */

@@ -414,6 +414,7 @@ __prestera_nh_neigh_create(struct prestera_switch *sw,
 	neigh->info.connected = false;
 	INIT_LIST_HEAD(&neigh->nexthop_group_list);
 	INIT_LIST_HEAD(&neigh->nh_mangle_entry_list);
+	INIT_LIST_HEAD(&neigh->l2tun_tep_list);
 	err = rhashtable_insert_fast(&sw->router->nh_neigh_ht,
 				     &neigh->ht_node,
 				     __prestera_nh_neigh_ht_params);
@@ -456,7 +457,8 @@ void prestera_nh_neigh_put(struct prestera_switch *sw,
 			   struct prestera_nh_neigh *neigh)
 {
 	if (list_empty(&neigh->nexthop_group_list) &&
-	    list_empty(&neigh->nh_mangle_entry_list))
+	    list_empty(&neigh->nh_mangle_entry_list) &&
+	    list_empty(&neigh->l2tun_tep_list))
 		__prestera_nh_neigh_destroy(sw, neigh);
 }
 
@@ -467,6 +469,7 @@ int prestera_nh_neigh_set(struct prestera_switch *sw,
 	struct prestera_nh_neigh_head *nh_head;
 	struct prestera_nexthop_group *nh_grp;
 	struct prestera_nh_mangle_entry *nm;
+	struct prestera_l2tun_tep *tep;
 	int err;
 
 	list_for_each_entry(nh_head, &neigh->nexthop_group_list, head) {
@@ -478,6 +481,12 @@ int prestera_nh_neigh_set(struct prestera_switch *sw,
 
 	list_for_each_entry(nm, &neigh->nh_mangle_entry_list, nh_neigh_head) {
 		err = prestera_nh_mangle_entry_set(sw, nm);
+		if (err)
+			return err;
+	}
+
+	list_for_each_entry(tep, &neigh->l2tun_tep_list, nh_neigh_head) {
+		err = prestera_l2tun_tep_set(sw, tep);
 		if (err)
 			return err;
 	}

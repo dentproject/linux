@@ -23,7 +23,7 @@
 
 #define SCT_CFG_SUBDIR_NAME		"sct"
 
-#define CPU_CODE_CNT_BUF_MAX_SIZE	(MVSW_PR_RXTX_CPU_CODE_MAX_NUM * 32)
+#define CPU_CODE_CNT_BUF_MAX_SIZE	(PRESTERA_RXTX_CPU_CODE_MAX_NUM * 32)
 
 static ssize_t prestera_cnt_read(struct file *file, char __user *ubuf,
 				 size_t count, loff_t *ppos);
@@ -294,7 +294,7 @@ int prestera_debugfs_init(struct prestera_switch *sw)
 		goto err_subdir_alloc;
 	}
 
-	for (i = 0; i < MVSW_PR_RXTX_CPU_CODE_MAX_NUM; ++i) {
+	for (i = 0; i < PRESTERA_RXTX_CPU_CODE_MAX_NUM; ++i) {
 		f_data.cpu_code = i;
 
 		snprintf(file_name, sizeof(file_name), "cpu_code_%d_stats", i);
@@ -330,7 +330,7 @@ int prestera_debugfs_init(struct prestera_switch *sw)
 		}
 	}
 
-	f_data.cpu_code = MVSW_PR_RXTX_CPU_CODE_MAX_NUM;
+	f_data.cpu_code = PRESTERA_RXTX_CPU_CODE_MAX_NUM;
 	f_data.cpu_code_cnt_type = CPU_CODE_CNT_TYPE_SW_TRAP;
 	debugfs_file = debugfs_create_file("cpu_code_stats", 0644,
 					   cpu_code_sw_cnt_trap_subdir,
@@ -409,7 +409,7 @@ static int prestera_cpu_code_cnt_get(u64 *stats, u8 cpu_code, u8 cnt_type)
 							 cpu_code, cnt_type,
 							 stats);
 	case CPU_CODE_CNT_TYPE_SW_TRAP:
-		*stats = mvsw_pr_rxtx_get_cpu_code_stats(cpu_code);
+		*stats = prestera_rxtx_get_cpu_code_stats(cpu_code);
 		return 0;
 	default:
 		return -EINVAL;
@@ -430,12 +430,12 @@ static ssize_t prestera_cnt_read(struct file *file, char __user *ubuf,
 
 	mutex_lock(&prestera_debugfs.cpu_code_cnt_buf_mtx);
 
-	if (f_data.cpu_code == MVSW_PR_RXTX_CPU_CODE_MAX_NUM) {
+	if (f_data.cpu_code == PRESTERA_RXTX_CPU_CODE_MAX_NUM) {
 		int i;
 
 		memset(buf, 0, CPU_CODE_CNT_BUF_MAX_SIZE);
 
-		for (i = 0; i < MVSW_PR_RXTX_CPU_CODE_MAX_NUM; ++i) {
+		for (i = 0; i < PRESTERA_RXTX_CPU_CODE_MAX_NUM; ++i) {
 			ret = prestera_cpu_code_cnt_get
 				(&cpu_code_stats, (u8)i,
 				 f_data.cpu_code_cnt_type);

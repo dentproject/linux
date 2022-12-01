@@ -19,6 +19,8 @@
  */
 #define W0_MASK_IFACE_PORT_NUM	GENMASK(23, 19)
 
+#define W0_MASK_SRC_TRUNK_ID	GENMASK(23, 19)
+
 /* bits 30:31 - TagCommand 1 = FROM_CPU */
 #define W0_MASK_DSA_CMD		GENMASK(31, 30)
 
@@ -27,6 +29,7 @@
 
 #define W0_MASK_EXT_BIT		BIT(12)
 #define W0_MASK_OPCODE		GENMASK(18, 16)
+#define W0_MASK_SRC_IS_TRUNK	BIT(18)
 
 /* bit 16 - CFI */
 #define W0_MASK_CFI_BIT		BIT(16)
@@ -34,7 +37,7 @@
 /* bits 0:11 -- VID */
 #define W0_MASK_VID		GENMASK(11, 0)
 
-#define W1_MASK_SRC_IS_TARNK	BIT(27)
+#define W1_MASK_SRC_IS_TRUNK	BIT(27)
 
 /* SrcPort/TrgPort extended to 8b
  * SrcPort/TrgPort[7:0] = {Word2[20], Word1[11:10], Word0[23:19]}
@@ -46,6 +49,9 @@
 
 /* bit 30 -- EgressFilterEn */
 #define W1_MASK_EGR_FILTER_EN	BIT(30)
+
+#define W1_MASK_SRC_TRUNK_ID	GENMASK(30, 29)
+#define W1_MASK_IFACE_EPORT	GENMASK(30, 29)
 
 /* bit 28 -- egrFilterRegistered */
 #define W1_MASK_EGR_FILTER_REG	BIT(28)
@@ -59,10 +65,14 @@
 /* SrcTrunk is extended to 12b
  * SrcTrunk[11:0] = {Word2[14:3]
  */
-#define W2_MASK_SRC_TRANK_ID	GENMASK(14, 3)
+#define W2_MASK_SRC_TRUNK_ID	GENMASK(14, 3)
+
+#define W2_FWD_MASK_SRC_TRUNK_ID	GENMASK(7, 3)
 
 /* SRCePort[16:0]/TRGePort[16:0]/ = {Word2[19:3]} */
 #define W2_MASK_IFACE_EPORT	GENMASK(19, 3)
+
+#define W2_FWD_MASK_IFACE_EPORT	GENMASK(12, 3)
 
 /* SrcPort/TrgPort extended to 8b
  * SrcPort/TrgPort[7:0] = {Word2[20], Word1[11:10], Word0[23:19]}
@@ -92,6 +102,8 @@
 /* VID becomes 16b eVLAN. eVLAN[15:0] = {Word3[30:27], Word0[11:0]} */
 #define W3_MASK_VID		GENMASK(30, 27)
 
+#define W3_MASK_SRC_IFACE_PORT_NUM	GENMASK(18, 7)
+
 /* TRGePort[16:0] = {Word3[23:7]} */
 #define W3_MASK_DST_EPORT	GENMASK(23, 7)
 
@@ -99,17 +111,17 @@
 #define VID_MASK		GENMASK(15, 12)
 
 static int net_if_dsa_to_cpu_parse(const u32 *words_ptr,
-				   struct mvsw_pr_dsa *dsa_info_ptr)
+				   struct prestera_dsa *dsa_info_ptr)
 {
 	u32 get_value;	/* used to get needed bits from the DSA */
-	struct mvsw_pr_dsa_to_cpu *to_cpu_ptr;
+	struct prestera_dsa_to_cpu *to_cpu_ptr;
 
 	to_cpu_ptr = &dsa_info_ptr->dsa_info.to_cpu;
 	to_cpu_ptr->is_tagged =
 	    (bool)FIELD_GET(W0_MASK_IS_TAGGED, words_ptr[0]);
 	to_cpu_ptr->hw_dev_num = FIELD_GET(W0_MASK_HW_DEV_NUM, words_ptr[0]);
 	to_cpu_ptr->src_is_trunk =
-	    (bool)FIELD_GET(W1_MASK_SRC_IS_TARNK, words_ptr[1]);
+	    (bool)FIELD_GET(W1_MASK_SRC_IS_TRUNK, words_ptr[1]);
 
 	/* set hw dev num */
 	get_value = FIELD_GET(W3_MASK_HW_DEV_NUM, words_ptr[3]);
@@ -121,7 +133,7 @@ static int net_if_dsa_to_cpu_parse(const u32 *words_ptr,
 
 	if (to_cpu_ptr->src_is_trunk) {
 		to_cpu_ptr->iface.src_trunk_id =
-		    (u16)FIELD_GET(W2_MASK_SRC_TRANK_ID, words_ptr[2]);
+		    (u16)FIELD_GET(W2_MASK_SRC_TRUNK_ID, words_ptr[2]);
 	} else {
 		/* When to_cpu_ptr->is_egress_pipe = false:
 		 *   this field indicates the source ePort number assigned by
@@ -141,7 +153,48 @@ static int net_if_dsa_to_cpu_parse(const u32 *words_ptr,
 	return 0;
 }
 
-int mvsw_pr_dsa_parse(const u8 *dsa_bytes_ptr, struct mvsw_pr_dsa *dsa_info_ptr)
+static int net_if_dsa_fwd_to_cpu_parse(const u32 *words_ptr,
+				       struct prestera_dsa *dsa_info_ptr)
+{
+	struct prestera_dsa_to_cpu *to_cpu_ptr;
+
+	to_cpu_ptr = &dsa_info_ptr->dsa_info.to_cpu;
+	to_cpu_ptr->is_tagged =
+	    (bool)FIELD_GET(W0_MASK_IS_TAGGED, words_ptr[0]);
+	to_cpu_ptr->hw_dev_num = FIELD_GET(W0_MASK_HW_DEV_NUM, words_ptr[0]);
+	to_cpu_ptr->src_is_trunk =
+	    (bool)FIELD_GET(W0_MASK_SRC_IS_TRUNK, words_ptr[0]);
+
+	/* Set CPU code to allow kernel flooding, after some resolvings */
+	to_cpu_ptr->cpu_code = 0;
+
+	if (to_cpu_ptr->src_is_trunk) {
+		to_cpu_ptr->iface.src_trunk_id =
+			(FIELD_GET(W0_MASK_SRC_TRUNK_ID, words_ptr[0]) << 0) |
+			(FIELD_GET(W1_MASK_SRC_TRUNK_ID, words_ptr[1]) << 5) |
+			(FIELD_GET(W2_FWD_MASK_SRC_TRUNK_ID, words_ptr[2]) << 7);
+	} else {
+		to_cpu_ptr->iface.eport =
+			(FIELD_GET(W0_MASK_IFACE_PORT_NUM, words_ptr[0]) << 0) |
+			(FIELD_GET(W1_MASK_IFACE_EPORT, words_ptr[1]) << 5) |
+			(FIELD_GET(W2_MASK_IFACE_EPORT, words_ptr[2]) << 7);
+	}
+
+	to_cpu_ptr->iface.port_num = FIELD_GET(W3_MASK_SRC_IFACE_PORT_NUM, words_ptr[3]);
+
+	/* When packet redirected from EportPhyMapping - src iface will be
+	 * equal to eport. And srcEport left from begin of pipeline.
+	 * TODO: Check if it correct
+	 * For now just force port_num to eport... This may affect tunnel-tunnel
+	 * scenario...
+	 */
+	if (!to_cpu_ptr->src_is_trunk)
+		to_cpu_ptr->iface.port_num = to_cpu_ptr->iface.eport;
+
+	return 0;
+}
+
+int prestera_dsa_parse(const u8 *dsa_bytes_ptr, struct prestera_dsa *dsa_info_ptr)
 {
 	u32 get_value;		/* used to get needed bits from the DSA */
 	u32 words_ptr[4] = { 0 };	/* DSA tag can be up to 4 words */
@@ -152,14 +205,14 @@ int mvsw_pr_dsa_parse(const u8 *dsa_bytes_ptr, struct mvsw_pr_dsa *dsa_info_ptr)
 		return -EINVAL;
 
 	/* zero results */
-	memset(dsa_info_ptr, 0, sizeof(struct mvsw_pr_dsa));
+	memset(dsa_info_ptr, 0, sizeof(struct prestera_dsa));
 
 	/* copy the data of the first word */
 	words_ptr[0] = ntohl((__force __be32)dsa_words_ptr[0]);
 
 	/* set the common parameters */
 	dsa_info_ptr->dsa_cmd =
-	    (enum mvsw_pr_dsa_cmd)FIELD_GET(W0_MASK_DSA_CMD, words_ptr[0]);
+	    (enum prestera_dsa_cmd)FIELD_GET(W0_MASK_DSA_CMD, words_ptr[0]);
 
 	/* vid & vlan prio */
 	dsa_info_ptr->common_params.vid =
@@ -167,8 +220,9 @@ int mvsw_pr_dsa_parse(const u8 *dsa_bytes_ptr, struct mvsw_pr_dsa *dsa_info_ptr)
 	dsa_info_ptr->common_params.vpt =
 	    (u8)FIELD_GET(W0_MASK_VPT, words_ptr[0]);
 
-	/* only to CPU is supported */
-	if (unlikely(dsa_info_ptr->dsa_cmd != MVSW_NET_DSA_CMD_TO_CPU_E))
+	/* only to CPU/FORWARD is supported */
+	if (unlikely(dsa_info_ptr->dsa_cmd != PRESTERA_DSA_CMD_TO_CPU &&
+		     dsa_info_ptr->dsa_cmd != PRESTERA_DSA_CMD_FORWARD))
 		return -EINVAL;
 
 	/* check extended bit */
@@ -176,25 +230,23 @@ int mvsw_pr_dsa_parse(const u8 *dsa_bytes_ptr, struct mvsw_pr_dsa *dsa_info_ptr)
 		/* 1 words DSA tag is not supported */
 		return -EINVAL;
 
-	/* check that the "old" cpu opcode is set the 0xF
-	 * (with the extended bit)
-	 */
-	if (FIELD_GET(W0_MASK_OPCODE, words_ptr[0]) != 0x07)
-		return -EINVAL;
-
 	/* copy the data of the second word */
 	words_ptr[1] = ntohl((__force __be32)dsa_words_ptr[1]);
+	dsa_info_ptr->common_params.cfi_bit =
+	    (u8)FIELD_GET(W1_MASK_CFI_BIT, words_ptr[1]);
 
 	/* check the extended bit */
-	if (FIELD_GET(W1_MASK_EXT_BIT, words_ptr[1]) == 0)
-		/* 2 words DSA tag is not supported */
-		return -EINVAL;
+	if (FIELD_GET(W1_MASK_EXT_BIT, words_ptr[1]) == 0) {
+		/* 2 words DSA tag */
+		dsa_info_ptr->dsa_type = PRESTERA_DSA_TYPE_EXTDSA8;
+		return net_if_dsa_to_cpu_parse(words_ptr, dsa_info_ptr);
+	}
 
 	/* copy the data of the third word */
 	words_ptr[2] = ntohl((__force __be32)dsa_words_ptr[2]);
 
 	/* check the extended bit */
-	if (FIELD_GET(W2_MASK_EXT_BIT, words_ptr[1]) == 0)
+	if (FIELD_GET(W2_MASK_EXT_BIT, words_ptr[2]) == 0)
 		/* 3 words DSA tag is not supported */
 		return -EINVAL;
 
@@ -206,18 +258,25 @@ int mvsw_pr_dsa_parse(const u8 *dsa_bytes_ptr, struct mvsw_pr_dsa *dsa_info_ptr)
 	dsa_info_ptr->common_params.vid &= ~VID_MASK;
 	dsa_info_ptr->common_params.vid |= FIELD_PREP(VID_MASK, get_value);
 
-	dsa_info_ptr->common_params.cfi_bit =
-	    (u8)FIELD_GET(W1_MASK_CFI_BIT, words_ptr[1]);
+	if (dsa_info_ptr->dsa_cmd == PRESTERA_DSA_CMD_TO_CPU) {
+		dsa_info_ptr->common_params.cfi_bit =
+			(u8)FIELD_GET(W1_MASK_CFI_BIT, words_ptr[1]);
+		return net_if_dsa_to_cpu_parse(words_ptr, dsa_info_ptr);
+	} else if (dsa_info_ptr->dsa_cmd == PRESTERA_DSA_CMD_FORWARD) {
+		dsa_info_ptr->common_params.cfi_bit =
+			(u8)FIELD_GET(W0_MASK_CFI_BIT, words_ptr[0]);
+		return net_if_dsa_fwd_to_cpu_parse(words_ptr, dsa_info_ptr);
+	}
 
-	return net_if_dsa_to_cpu_parse(words_ptr, dsa_info_ptr);
+	return -EINVAL;
 }
 
-static int net_if_dsa_tag_from_cpu_build(const struct mvsw_pr_dsa *dsa_info_ptr,
+static int net_if_dsa_tag_from_cpu_build(const struct prestera_dsa *dsa_info_ptr,
 					 u32 *words_ptr)
 {
 	u32 trg_hw_dev = 0;
 	u32 trg_port = 0;
-	const struct mvsw_pr_dsa_from_cpu *from_cpu_ptr =
+	const struct prestera_dsa_from_cpu *from_cpu_ptr =
 	    &dsa_info_ptr->dsa_info.from_cpu;
 
 	if (unlikely(from_cpu_ptr->dst_iface.type != PRESTERA_IF_PORT_E))
@@ -225,7 +284,7 @@ static int net_if_dsa_tag_from_cpu_build(const struct mvsw_pr_dsa *dsa_info_ptr,
 		return -EINVAL;
 
 	words_ptr[0] |=
-	    FIELD_PREP(W0_MASK_DSA_CMD, MVSW_NET_DSA_CMD_FROM_CPU_E);
+	    FIELD_PREP(W0_MASK_DSA_CMD, PRESTERA_DSA_CMD_FROM_CPU);
 
 	trg_hw_dev = from_cpu_ptr->dst_iface.dev_port.hw_dev_num;
 	trg_port = from_cpu_ptr->dst_iface.dev_port.port_num;
@@ -237,7 +296,9 @@ static int net_if_dsa_tag_from_cpu_build(const struct mvsw_pr_dsa *dsa_info_ptr,
 		return -EINVAL;
 
 	words_ptr[0] |= FIELD_PREP(W0_MASK_HW_DEV_NUM, trg_hw_dev);
-	words_ptr[3] |= FIELD_PREP(W3_MASK_HW_DEV_NUM, (trg_hw_dev >> 5));
+
+	if (likely(dsa_info_ptr->dsa_type == PRESTERA_DSA_TYPE_EDSA16))
+		words_ptr[3] |= FIELD_PREP(W3_MASK_HW_DEV_NUM, (trg_hw_dev >> 5));
 
 	if (dsa_info_ptr->common_params.cfi_bit == 1)
 		words_ptr[0] |= FIELD_PREP(W0_MASK_CFI_BIT, 1);
@@ -249,8 +310,10 @@ static int net_if_dsa_tag_from_cpu_build(const struct mvsw_pr_dsa *dsa_info_ptr,
 
 	/* set extended bits */
 	words_ptr[0] |= FIELD_PREP(W0_MASK_EXT_BIT, 1);
-	words_ptr[1] |= FIELD_PREP(W1_MASK_EXT_BIT, 1);
-	words_ptr[2] |= FIELD_PREP(W2_MASK_EXT_BIT, 1);
+	if (likely(dsa_info_ptr->dsa_type == PRESTERA_DSA_TYPE_EDSA16)) {
+		words_ptr[1] |= FIELD_PREP(W1_MASK_EXT_BIT, 1);
+		words_ptr[2] |= FIELD_PREP(W2_MASK_EXT_BIT, 1);
+	}
 
 	if (from_cpu_ptr->egr_filter_en)
 		words_ptr[1] |= FIELD_PREP(W1_MASK_EGR_FILTER_EN, 1);
@@ -267,23 +330,34 @@ static int net_if_dsa_tag_from_cpu_build(const struct mvsw_pr_dsa *dsa_info_ptr,
 	words_ptr[1] |= FIELD_PREP(W1_MASK_SRC_ID, from_cpu_ptr->src_id);
 	words_ptr[1] |= FIELD_PREP(W1_MASK_SRC_DEV, from_cpu_ptr->src_hw_dev);
 
-	words_ptr[2] |= FIELD_PREP(W2_MASK_SRC_ID, from_cpu_ptr->src_id >> 5);
-	words_ptr[2] |= FIELD_PREP(W2_MASK_SRC_DEV,
+	if (likely(dsa_info_ptr->dsa_type == PRESTERA_DSA_TYPE_EDSA16)) {
+		words_ptr[2] |= FIELD_PREP(W2_MASK_SRC_ID, from_cpu_ptr->src_id >> 5);
+		words_ptr[2] |= FIELD_PREP(W2_MASK_SRC_DEV,
 				   from_cpu_ptr->src_hw_dev >> 5);
+	}
 
 	/* bits 0:9 -- reserved with value 0 */
 	if (from_cpu_ptr->dst_eport >= BIT(17))
 		return -EINVAL;
 
-	words_ptr[3] |= FIELD_PREP(W3_MASK_DST_EPORT, from_cpu_ptr->dst_eport);
-	words_ptr[3] |= FIELD_PREP(W3_MASK_VID,
-				   (dsa_info_ptr->common_params.vid >> 12));
+	if (likely(dsa_info_ptr->dsa_type == PRESTERA_DSA_TYPE_EDSA16)) {
+		words_ptr[3] |= FIELD_PREP(W3_MASK_DST_EPORT, from_cpu_ptr->dst_eport);
+		words_ptr[3] |= FIELD_PREP(W3_MASK_VID,
+					   (dsa_info_ptr->common_params.vid >> 12));
+	} else {
+		words_ptr[0] |=
+			FIELD_PREP(W0_MASK_IFACE_PORT_NUM,
+				   from_cpu_ptr->dst_iface.dev_port.port_num);
+		words_ptr[1] |=
+			FIELD_PREP(W1_MASK_IFACE_PORT_NUM,
+				   from_cpu_ptr->dst_iface.dev_port.port_num >> 5);
+	}
 
 	return 0;
 }
 
-int mvsw_pr_dsa_build(const struct mvsw_pr_dsa *dsa_info_ptr,
-		      u8 *dsa_bytes_ptr)
+int prestera_dsa_build(const struct prestera_dsa *dsa_info_ptr,
+		       u8 *dsa_bytes_ptr)
 {
 	int rc;
 	u32 words_ptr[4] = { 0 };	/* 4 words of DSA tag */
@@ -297,7 +371,7 @@ int mvsw_pr_dsa_build(const struct mvsw_pr_dsa *dsa_info_ptr,
 		return -EINVAL;
 	}
 
-	if (unlikely(dsa_info_ptr->dsa_cmd != MVSW_NET_DSA_CMD_FROM_CPU_E))
+	if (unlikely(dsa_info_ptr->dsa_cmd != PRESTERA_DSA_CMD_FROM_CPU))
 		return -EINVAL;
 
 	/* build form CPU DSA tag */
@@ -307,8 +381,10 @@ int mvsw_pr_dsa_build(const struct mvsw_pr_dsa *dsa_info_ptr,
 
 	dsa_words_ptr[0] = htonl(words_ptr[0]);
 	dsa_words_ptr[1] = htonl(words_ptr[1]);
-	dsa_words_ptr[2] = htonl(words_ptr[2]);
-	dsa_words_ptr[3] = htonl(words_ptr[3]);
+	if (likely(dsa_info_ptr->dsa_type == PRESTERA_DSA_TYPE_EDSA16)) {
+		dsa_words_ptr[2] = htonl(words_ptr[2]);
+		dsa_words_ptr[3] = htonl(words_ptr[3]);
+	}
 
 	return 0;
 }

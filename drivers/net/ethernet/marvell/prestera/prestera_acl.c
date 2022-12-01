@@ -8,6 +8,7 @@
 #include "prestera_log.h"
 #include "prestera_ct.h"
 #include "prestera_acl.h"
+#include "prestera_flow.h"
 
 #define PRESTERA_ACL_RULE_DEF_HW_TC	3
 #define ACL_KEYMASK_SIZE	\
@@ -25,24 +26,28 @@ struct prestera_acl_ruleset {
 	struct prestera_acl_ruleset_ht_key ht_key;
 	struct rhashtable rule_ht;
 	struct prestera_acl *acl;
+	struct {
+		u32 min;
+		u32 max;
+	} prio;
 	unsigned long rule_count;
 	refcount_t refcount;
 	void *keymask;
-	bool offload;
 	u32 vtcam_id;
-	u16 pcl_id;
 	u32 index;
+	u16 pcl_id;
+	bool offload;
 	bool ingress;
 };
 
 struct prestera_acl_vtcam {
 	struct list_head list;
 	__be32 keymask[__PRESTERA_ACL_RULE_MATCH_TYPE_MAX];
-	bool is_keymask_set;
 	refcount_t refcount;
-	u8 direction;
-	u8 lookup;
 	u32 id;
+	bool is_keymask_set;
+	u8 lookup;
+	u8 direction;
 };
 
 static const struct rhashtable_params prestera_acl_ruleset_ht_params = {
@@ -59,13 +64,6 @@ static const struct rhashtable_params prestera_acl_rule_ht_params = {
 	.automatic_shrinking = true,
 };
 
-static const struct rhashtable_params __prestera_nh_mangle_entry_ht_params = {
-	.key_offset  = offsetof(struct prestera_nh_mangle_entry, key),
-	.head_offset = offsetof(struct prestera_nh_mangle_entry, ht_node),
-	.key_len     = sizeof(struct prestera_nh_mangle_entry_key),
-	.automatic_shrinking = true,
-};
-
 static const struct rhashtable_params __prestera_acl_rule_entry_ht_params = {
 	.key_offset  = offsetof(struct prestera_acl_rule_entry, key),
 	.head_offset = offsetof(struct prestera_acl_rule_entry, ht_node),
@@ -73,9 +71,16 @@ static const struct rhashtable_params __prestera_acl_rule_entry_ht_params = {
 	.automatic_shrinking = true,
 };
 
+static const struct rhashtable_params __prestera_nh_mangle_entry_ht_params = {
+	.key_offset  = offsetof(struct prestera_nh_mangle_entry, key),
+	.head_offset = offsetof(struct prestera_nh_mangle_entry, ht_node),
+	.key_len     = sizeof(struct prestera_nh_mangle_entry_key),
+	.automatic_shrinking = true,
+};
+
 int prestera_acl_chain_to_client(u32 chain_index, bool ingress, u32 *client)
 {
-	u32 ingress_client_map[] = {
+	static const u32 ingress_client_map[] = {
 		PRESTERA_HW_COUNTER_CLIENT_INGRESS_LOOKUP_0,
 		PRESTERA_HW_COUNTER_CLIENT_INGRESS_LOOKUP_1,
 		PRESTERA_HW_COUNTER_CLIENT_INGRESS_LOOKUP_2
@@ -190,6 +195,9 @@ prestera_acl_ruleset_create(struct prestera_acl *acl,
 	/* make pcl-id based on uid and chain */
 	ruleset->pcl_id = PRESTERA_ACL_PCL_ID_MAKE((u8)uid, chain_index);
 	ruleset->index = uid;
+
+	ruleset->prio.min = UINT_MAX;
+	ruleset->prio.max = 0;
 
 	err = rhashtable_insert_fast(&acl->ruleset_ht, &ruleset->ht_node,
 				     prestera_acl_ruleset_ht_params);
@@ -394,24 +402,28 @@ prestera_acl_ruleset_block_unbind(struct prestera_acl_ruleset *ruleset,
 	block->ruleset_zero = NULL;
 }
 
-void prestera_acl_block_prio_update(struct prestera_switch *sw,
-				    struct prestera_flow_block *block)
+static void
+prestera_acl_ruleset_prio_refresh(struct prestera_acl *acl,
+				  struct prestera_acl_ruleset *ruleset)
 {
-	struct prestera_acl *acl = sw->acl;
 	struct prestera_acl_rule *rule;
-	u32 new_prio = UINT_MAX;
 
+	ruleset->prio.min = UINT_MAX;
+	ruleset->prio.max = 0;
+
+	/* TODO: we're iterating over all the rules in acl here (ingress/egress, all chains)
+	 * while we're interested in particular chain (ruleset) only.
+	 * Having a list of all rules in a ruleset would improve performance here.
+	 */
 	list_for_each_entry(rule, &acl->rules, list) {
-		if (rule->priority < new_prio)
-			new_prio = rule->priority;
+		if (ruleset->ingress != rule->ruleset->ingress)
+			continue;
+		if (ruleset->ht_key.chain_index != rule->chain_index)
+			continue;
+
+		ruleset->prio.min = min(ruleset->prio.min, rule->priority);
+		ruleset->prio.max = max(ruleset->prio.max, rule->priority);
 	}
-
-	block->flower_min_prio = new_prio;
-}
-
-unsigned int prestera_acl_block_rule_count(struct prestera_flow_block *block)
-{
-	return block ? block->rule_count : 0;
 }
 
 void
@@ -425,16 +437,6 @@ prestera_acl_rule_keymask_pcl_id_set(struct prestera_acl_rule *rule, u16 pcl_id)
 	rule_match_set(r_match->mask, PCL_ID, pcl_id_mask);
 }
 
-struct net *prestera_acl_block_net(struct prestera_flow_block *block)
-{
-	return block->net;
-}
-
-struct prestera_switch *prestera_acl_block_sw(struct prestera_flow_block *block)
-{
-	return block->sw;
-}
-
 struct prestera_acl_rule *
 prestera_acl_rule_lookup(struct prestera_acl_ruleset *ruleset,
 			 unsigned long cookie)
@@ -446,6 +448,13 @@ prestera_acl_rule_lookup(struct prestera_acl_ruleset *ruleset,
 u32 prestera_acl_ruleset_index_get(const struct prestera_acl_ruleset *ruleset)
 {
 	return ruleset->index;
+}
+
+void prestera_acl_ruleset_prio_get(struct prestera_acl_ruleset *ruleset,
+				   u32 *prio_min, u32 *prio_max)
+{
+	*prio_min = ruleset->prio.min;
+	*prio_max = ruleset->prio.max;
 }
 
 bool prestera_acl_ruleset_is_offload(struct prestera_acl_ruleset *ruleset)
@@ -542,6 +551,13 @@ void prestera_acl_rule_destroy(struct prestera_acl_rule *rule)
 	kfree(rule);
 }
 
+static void prestera_acl_ruleset_prio_update(struct prestera_acl_ruleset *ruleset,
+					     u32 prio)
+{
+	ruleset->prio.min = min(ruleset->prio.min, prio);
+	ruleset->prio.max = max(ruleset->prio.max, prio);
+}
+
 int prestera_acl_rule_add(struct prestera_switch *sw,
 			  struct prestera_acl_rule *rule)
 {
@@ -634,8 +650,8 @@ nat_port_neigh_not_found:
 	}
 
 	list_add_tail(&rule->list, &sw->acl->rules);
-	ruleset->ht_key.block->rule_count++;
 	ruleset->rule_count++;
+	prestera_acl_ruleset_prio_update(ruleset, rule->priority);
 	return 0;
 
 err_acl_block_bind:
@@ -658,7 +674,6 @@ void prestera_acl_rule_del(struct prestera_switch *sw,
 
 	rhashtable_remove_fast(&ruleset->rule_ht, &rule->ht_node,
 			       prestera_acl_rule_ht_params);
-	block->rule_count--;
 	ruleset->rule_count--;
 	list_del(&rule->list);
 
@@ -666,7 +681,7 @@ void prestera_acl_rule_del(struct prestera_switch *sw,
 		prestera_ct_ft_offload_del_cb(sw, rule);
 	} else {
 		prestera_acl_rule_entry_destroy(sw->acl, rule->re);
-		prestera_acl_block_prio_update(sw, block);
+		prestera_acl_ruleset_prio_refresh(sw->acl, ruleset);
 	}
 
 	/* unbind block (all ports) */
@@ -843,7 +858,7 @@ static int __prestera_acl_rule_entry2hw_del(struct prestera_switch *sw,
 static int __prestera_acl_rule_entry2hw_add(struct prestera_switch *sw,
 					    struct prestera_acl_rule_entry *e)
 {
-	struct prestera_acl_hw_action_info act_hw[PRESTERA_ACL_ACTION_MAX];
+	struct prestera_acl_hw_action_info act_hw[PRESTERA_ACL_RULE_ACTION_MAX];
 	int act_num;
 
 	memset(&act_hw, 0, sizeof(act_hw));
@@ -918,6 +933,9 @@ __prestera_acl_rule_entry_act_destruct(struct prestera_switch *sw,
 	}
 	/* counter */
 	prestera_counter_put(sw->counter, e->counter.block, e->counter.id);
+	/* police */
+	if (e->police.valid)
+		prestera_hw_policer_release(sw, e->police.i.id);
 }
 
 void prestera_acl_rule_entry_destroy(struct prestera_acl *acl,
@@ -940,6 +958,8 @@ __prestera_acl_rule_entry_act_construct(struct prestera_switch *sw,
 					struct prestera_acl_rule_entry *e,
 					struct prestera_acl_rule_entry_arg *arg)
 {
+	int err;
+
 	/* accept */
 	e->accept.valid = arg->accept.valid;
 	/* drop */
@@ -947,15 +967,30 @@ __prestera_acl_rule_entry_act_construct(struct prestera_switch *sw,
 	/* trap */
 	e->trap.valid = arg->trap.valid;
 	e->trap.i = arg->trap.i;
-	/* police */
-	e->police.valid = arg->police.valid;
-	e->police.i = arg->police.i;
-	/* nat */
-	e->nat.valid = arg->nat.valid;
-	e->nat.i = arg->nat.i;
 	/* jump */
 	e->jump.valid = arg->jump.valid;
 	e->jump.i = arg->jump.i;
+	/* police */
+	if (arg->police.valid) {
+		u8 type = arg->police.ingress ? PRESTERA_POLICER_TYPE_INGRESS :
+						PRESTERA_POLICER_TYPE_EGRESS;
+
+		err = prestera_hw_policer_create(sw, type, &e->police.i.id);
+		if (err)
+			goto err_out;
+
+		err = prestera_hw_policer_sr_tcm_set(sw, e->police.i.id,
+						     arg->police.rate,
+						     arg->police.burst);
+		if (err) {
+			prestera_hw_policer_release(sw, e->police.i.id);
+			goto err_out;
+		}
+		e->police.valid = arg->police.valid;
+	}
+	/* nat */
+	e->nat.valid = arg->nat.valid;
+	e->nat.i = arg->nat.i;
 	/* nh */
 	if (arg->nh.valid) {
 		e->nh.e = prestera_nh_mangle_entry_get(sw, &arg->nh.k);
@@ -967,8 +1002,6 @@ __prestera_acl_rule_entry_act_construct(struct prestera_switch *sw,
 	}
 	/* counter */
 	if (arg->count.valid) {
-		int err;
-
 		err = prestera_counter_get(sw->counter, arg->count.client,
 					   &e->counter.block,
 					   &e->counter.id);
