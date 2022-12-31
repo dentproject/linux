@@ -11,6 +11,8 @@ struct prestera_counter_stats {
 	u64 bytes;
 };
 
+struct prestera_switch;
+struct prestera_counter;
 struct prestera_counter_block;
 
 int prestera_counter_init(struct prestera_switch *sw);

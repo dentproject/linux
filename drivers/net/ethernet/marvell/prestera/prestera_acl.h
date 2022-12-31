@@ -48,43 +48,103 @@
 #define MVSW_ACL_RULE_DEF_HW_CHAIN_ID	0
 #define MVSW_ACL_RULESET_ALL		0xff
 
-#define PRESTERA_ACL_ACTION_MAX 8
+enum prestera_acl_match_type {
+	PRESTERA_ACL_RULE_MATCH_TYPE_PCL_ID,
+	PRESTERA_ACL_RULE_MATCH_TYPE_ETH_TYPE,
+	PRESTERA_ACL_RULE_MATCH_TYPE_ETH_DMAC_0,
+	PRESTERA_ACL_RULE_MATCH_TYPE_ETH_DMAC_1,
+	PRESTERA_ACL_RULE_MATCH_TYPE_ETH_SMAC_0,
+	PRESTERA_ACL_RULE_MATCH_TYPE_ETH_SMAC_1,
+	PRESTERA_ACL_RULE_MATCH_TYPE_IP_PROTO,
+	PRESTERA_ACL_RULE_MATCH_TYPE_SYS_PORT,
+	PRESTERA_ACL_RULE_MATCH_TYPE_SYS_DEV,
+	PRESTERA_ACL_RULE_MATCH_TYPE_IP_SRC,
+	PRESTERA_ACL_RULE_MATCH_TYPE_IP_DST,
+	PRESTERA_ACL_RULE_MATCH_TYPE_L4_PORT_SRC,
+	PRESTERA_ACL_RULE_MATCH_TYPE_L4_PORT_DST,
+	PRESTERA_ACL_RULE_MATCH_TYPE_L4_PORT_RANGE_SRC,
+	PRESTERA_ACL_RULE_MATCH_TYPE_L4_PORT_RANGE_DST,
+	PRESTERA_ACL_RULE_MATCH_TYPE_VLAN_ID,
+	PRESTERA_ACL_RULE_MATCH_TYPE_VLAN_TPID,
+	PRESTERA_ACL_RULE_MATCH_TYPE_ICMP_TYPE,
+	PRESTERA_ACL_RULE_MATCH_TYPE_ICMP_CODE,
+	PRESTERA_ACL_RULE_MATCH_TYPE_QOS_PROFILE,
+	PRESTERA_ACL_RULE_MATCH_TYPE_IPV6_SRC_0,
+	PRESTERA_ACL_RULE_MATCH_TYPE_IPV6_SRC_1,
+	PRESTERA_ACL_RULE_MATCH_TYPE_IPV6_SRC_2,
+	PRESTERA_ACL_RULE_MATCH_TYPE_IPV6_SRC_3,
+	PRESTERA_ACL_RULE_MATCH_TYPE_IPV6_DST_0,
+	PRESTERA_ACL_RULE_MATCH_TYPE_IPV6_DST_1,
+	PRESTERA_ACL_RULE_MATCH_TYPE_IPV6_DST_2,
+	PRESTERA_ACL_RULE_MATCH_TYPE_IPV6_DST_3,
 
-/* HW objects infrastructure */
-struct prestera_mangle_cfg {
-	u8 l4_src_valid:1, l4_dst_valid:1,
-	   sip_valid:1, dip_valid:1;
-	__be16 l4_src;
-	__be16 l4_dst;
-	struct prestera_ip_addr sip;
-	struct prestera_ip_addr dip;
+	__PRESTERA_ACL_RULE_MATCH_TYPE_MAX
 };
 
-/* TODO: Move mangle_entry to router ? */
-struct prestera_nh_mangle_entry {
-	struct rhash_head ht_node; /* node of prestera_router */
-	struct prestera_nh_mangle_entry_key {
-		struct prestera_mangle_cfg mangle;
-		struct prestera_nh_neigh_key n;
-	} key;
-	struct prestera_nh_neigh *n;
-	u32 hw_id;
-	unsigned long is_active_hw_cache_kick; /* jiffies */
-	bool is_active_hw_cache;
-	u32 ref_cnt;
-	struct list_head nh_neigh_head;
+enum prestera_acl_rule_action {
+	PRESTERA_ACL_RULE_ACTION_ACCEPT = 0,
+	PRESTERA_ACL_RULE_ACTION_DROP = 1,
+	PRESTERA_ACL_RULE_ACTION_TRAP = 2,
+	PRESTERA_ACL_RULE_ACTION_NAT = 4,
+	PRESTERA_ACL_RULE_ACTION_JUMP = 5,
+	PRESTERA_ACL_RULE_ACTION_NH = 6,
+	PRESTERA_ACL_RULE_ACTION_COUNT = 7,
+	PRESTERA_ACL_RULE_ACTION_POLICE = 8,
+	PRESTERA_ACL_RULE_ACTION_REMARK = 9,
+
+	PRESTERA_ACL_RULE_ACTION_MAX
+};
+
+enum {
+	PRESTERA_ACL_IFACE_TYPE_PORT,
+	PRESTERA_ACL_IFACE_TYPE_INDEX
+};
+
+struct prestera_acl_match {
+	__be32 key[__PRESTERA_ACL_RULE_MATCH_TYPE_MAX];
+	__be32 mask[__PRESTERA_ACL_RULE_MATCH_TYPE_MAX];
+};
+
+struct prestera_acl_action_jump {
+	u32 index;
+};
+
+struct prestera_acl_action_trap {
+	u8 hw_tc;
+};
+
+struct prestera_acl_action_nat {
+	__be32 old_addr;
+	__be32 new_addr;
+	u32 port;
+	u32 dev;
+	u32 flags;
+};
+
+struct prestera_acl_action_police {
+	u32 id;
+};
+
+struct prestera_acl_action_count {
+	u32 id;
+};
+
+struct prestera_acl_action_remark {
+	u32 dscp;
+};
+
+struct prestera_acl_rule_entry_key {
+	u32 prio;
+	struct prestera_acl_match match;
 };
 
 struct prestera_acl_rule_entry {
 	struct rhash_head ht_node; /* node of prestera_sw */
-	struct prestera_acl_rule_entry_key {
-		u32 prio;
-		struct prestera_acl_match match;
-	} key;
+	struct prestera_acl_rule_entry_key key;
 	u32 hw_id;
 	u32 vtcam_id;
 	/* This struct seems to be dublicate of arg, but purpose is to pass
-	 * in cfg objet keys, resolve them and save object links here.
+	 * in cfg object keys, resolve them and save object links here.
 	 * E.g. chain can be link to object, when chain_id just key in cfg.
 	 */
 	struct {
@@ -122,6 +182,45 @@ struct prestera_acl_rule_entry {
 	};
 };
 
+/* Used for hw call */
+struct prestera_acl_hw_action_info {
+	enum prestera_acl_rule_action id;
+	union {
+		struct prestera_acl_action_trap trap;
+		struct prestera_acl_action_police police;
+		u32 nh;
+		struct prestera_acl_action_nat nat;
+		struct prestera_acl_action_jump jump;
+		struct prestera_acl_action_count count;
+		struct prestera_acl_action_remark remark;
+	};
+};
+
+/* HW objects infrastructure */
+struct prestera_mangle_cfg {
+	u8 l4_src_valid:1, l4_dst_valid:1,
+	   sip_valid:1, dip_valid:1;
+	__be16 l4_src;
+	__be16 l4_dst;
+	struct prestera_ip_addr sip;
+	struct prestera_ip_addr dip;
+};
+
+/* TODO: Move mangle_entry to router ? */
+struct prestera_nh_mangle_entry {
+	struct rhash_head ht_node; /* node of prestera_router */
+	struct prestera_nh_mangle_entry_key {
+		struct prestera_mangle_cfg mangle;
+		struct prestera_nh_neigh_key n;
+	} key;
+	struct prestera_nh_neigh *n;
+	u32 hw_id;
+	unsigned long is_active_hw_cache_kick; /* jiffies */
+	bool is_active_hw_cache;
+	u32 ref_cnt;
+	struct list_head nh_neigh_head;
+};
+
 /* This struct (arg) used only to be passed as parameter for
  * acl_rule_entry_create. Must be flat. Can contain object keys, which will be
  * resolved to object links, before saving to acl_rule_entry struct
@@ -138,7 +237,9 @@ struct prestera_acl_rule_entry_arg {
 		} trap;
 		struct {
 			u8 valid:1;
-			struct prestera_acl_action_police i;
+			u64 rate;
+			u64 burst;
+			bool ingress;
 		} police;
 		struct {
 			u8 valid:1;
@@ -214,18 +315,20 @@ struct prestera_acl_rule {
 	struct prestera_acl_rule_entry *re;
 };
 
-enum {
-	PRESTERA_ACL_IFACE_TYPE_PORT,
-	PRESTERA_ACL_IFACE_TYPE_INDEX
-};
-
 struct prestera_acl_iface {
-	u8 type;
 	union {
 		struct prestera_port *port;
 		u32 index;
 	};
+	u8 type;
 };
+
+struct prestera_acl;
+struct prestera_switch;
+struct prestera_flow_block;
+
+int prestera_acl_init(struct prestera_switch *sw);
+void prestera_acl_fini(struct prestera_switch *sw);
 
 void prestera_acl_rule_flag_set(struct prestera_acl_rule *rule,
 				unsigned long flag);
@@ -275,17 +378,20 @@ prestera_acl_ruleset_lookup(struct prestera_acl *acl,
 			    u32 chain_index);
 void prestera_acl_ruleset_keymask_set(struct prestera_acl_ruleset *ruleset,
 				      void *keymask);
-int prestera_acl_ruleset_offload(struct prestera_acl_ruleset *ruleset);
-u32 prestera_acl_ruleset_index_get(const struct prestera_acl_ruleset *ruleset);
 bool prestera_acl_ruleset_is_offload(struct prestera_acl_ruleset *ruleset);
+int prestera_acl_ruleset_offload(struct prestera_acl_ruleset *ruleset);
 void prestera_acl_ruleset_put(struct prestera_acl_ruleset *ruleset);
 int prestera_acl_ruleset_bind(struct prestera_acl_ruleset *ruleset,
 			      struct prestera_port *port);
 int prestera_acl_ruleset_unbind(struct prestera_acl_ruleset *ruleset,
 				struct prestera_port *port);
+u32 prestera_acl_ruleset_index_get(const struct prestera_acl_ruleset *ruleset);
+void prestera_acl_ruleset_prio_get(struct prestera_acl_ruleset *ruleset,
+				   u32 *prio_min, u32 *prio_max);
 void
 prestera_acl_rule_keymask_pcl_id_set(struct prestera_acl_rule *rule,
 				     u16 pcl_id);
+
 int prestera_acl_vtcam_id_get(struct prestera_acl *acl, u8 lookup, u8 dir,
 			      void *keymask, u32 *vtcam_id);
 int prestera_acl_vtcam_id_put(struct prestera_acl *acl, u32 vtcam_id);

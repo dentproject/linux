@@ -340,7 +340,7 @@ static void prestera_port_mdix_cache(struct prestera_port *port)
 
 	if (prestera_hw_port_phy_mode_get(port, &state->mdix,
 					  NULL, NULL, NULL)) {
-		netdev_warn(port->net_dev, "MDIX params get failed");
+		netdev_warn_once(port->net_dev, "MDIX params get failed");
 		state->mdix = ETH_TP_MDI_INVALID;
 	}
 }

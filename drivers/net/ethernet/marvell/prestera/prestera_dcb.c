@@ -323,19 +323,20 @@ static int prestera_dcb_port_app_update(struct prestera_port *port,
 static int prestera_dcb_port_app_flush(struct prestera_port *port,
 				       struct dcb_app *app)
 {
+	u8 default_prio = prestera_dcb_port_default_prio(port);
 	int err;
-
-	err = prestera_hw_port_qos_default_prio_set(port, 0);
-	if (err) {
-		netdev_err(port->net_dev,
-			   "Failed to reset default priority\n");
-		return err;
-	}
 
 	err = prestera_port_trust_mode_set(port, PRESTERA_HW_QOS_TRUST_MODE_L2);
 	if (err) {
 		netdev_err(port->net_dev,
 			   "Failed to reset trust mode\n");
+		return err;
+	}
+
+	err = prestera_hw_port_qos_default_prio_set(port, default_prio);
+	if (err) {
+		netdev_err(port->net_dev,
+			   "Failed to reset default priority\n");
 		return err;
 	}
 
