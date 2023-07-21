@@ -250,7 +250,7 @@ prestera_kern_fib_info_nhc(struct fib_notifier_info *info, int n)
 	if (info->family == AF_INET) {
 		fen4_info = container_of(info, struct fib_entry_notifier_info,
 					 info);
-		return &fib_info_nh(fen4_info->fi, n)->nh_common;
+		return fib_info_nhc(fen4_info->fi, n);
 	} else if (info->family == AF_INET6) {
 		fen6_info = container_of(info, struct fib6_entry_notifier_info,
 					 info);
@@ -526,7 +526,7 @@ int prestera_util_kern_dip2nh_grp_key(struct prestera_switch *sw,
 				      struct prestera_nexthop_group_key *res)
 {
 	struct fib_result fib_res;
-	struct fib_nh *fib_nh;
+	struct fib_nh_common *fib_nhc;
 	int err;
 
 	/* TODO: support IPv6 */
@@ -538,10 +538,10 @@ int prestera_util_kern_dip2nh_grp_key(struct prestera_switch *sw,
 		return 0;
 
 	if (prestera_fi_is_direct(fib_res.fi)) {
-		fib_nh = fib_info_nh(fib_res.fi, 0);
+		fib_nhc = fib_info_nhc(fib_res.fi, 0);
 		memset(res, 0, sizeof(*res));
 		res->neigh[0].addr = *addr;
-		res->neigh[0].rif = fib_nh->fib_nh_dev;
+		res->neigh[0].rif = fib_nhc->nhc_dev;
 		return 1;
 	}
 
@@ -562,7 +562,7 @@ static bool
 __prestera_util_kern_n_is_reachable_v4(u32 tb_id, __be32 *addr,
 				       struct net_device *dev)
 {
-	struct fib_nh *fib_nh;
+	struct fib_nh_common *fib_nhc;
 	struct fib_result res;
 	bool reachable;
 
@@ -570,8 +570,8 @@ __prestera_util_kern_n_is_reachable_v4(u32 tb_id, __be32 *addr,
 
 	if (!prestera_util_kern_get_route(&res, tb_id, addr))
 		if (prestera_fi_is_direct(res.fi)) {
-			fib_nh = fib_info_nh(res.fi, 0);
-			if (dev == fib_nh->fib_nh_dev)
+			fib_nhc = fib_info_nhc(res.fi, 0);
+			if (dev == fib_nhc->nhc_dev)
 				reachable = true;
 		}
 
@@ -677,7 +677,6 @@ mvsw_pr_util_fi2nh_gr_key(struct prestera_switch *sw, struct fib_info *fi,
 			  size_t limit,
 			  struct prestera_nexthop_group_key *grp_key)
 {
-	struct fib_nh *fib_nh;
 	int i, nhs, err;
 
 	if (!prestera_fi_is_nh(fi))
@@ -689,8 +688,7 @@ mvsw_pr_util_fi2nh_gr_key(struct prestera_switch *sw, struct fib_info *fi,
 
 	memset(grp_key, 0, sizeof(*grp_key));
 	for (i = 0; i < nhs; i++) {
-		fib_nh = fib_info_nh(fi, i);
-		err = prestera_util_nhc2nh_neigh_key(sw, &fib_nh->nh_common,
+		err = prestera_util_nhc2nh_neigh_key(sw, fib_info_nhc(fi, i),
 						     &grp_key->neigh[i]);
 		if (err)
 			return 0;
@@ -2472,11 +2470,11 @@ out:
 
 static bool __prestera_fi_is_direct(struct fib_info *fi)
 {
-	struct fib_nh *fib_nh;
+	struct fib_nh_common *fib_nhc;
 
 	if (fib_info_num_path(fi) == 1) {
-		fib_nh = fib_info_nh(fi, 0);
-		if (fib_nh->fib_nh_gw_family == AF_UNSPEC)
+		fib_nhc = fib_info_nhc(fi, 0);
+		if (fib_nhc->nhc_gw_family == AF_UNSPEC)
 			return true;
 	}
 
@@ -2697,9 +2695,6 @@ __prestera_router_fib4_event(struct prestera_switch *sw, unsigned long event,
 
 	/* Sanity */
 	if (event == FIB_EVENT_ENTRY_REPLACE) {
-		if (fen_info->fi->nh)
-			return notifier_from_errno(-EINVAL);
-
 		if (fen_info->fi->fib_nh_is_v6)
 			return notifier_from_errno(-EINVAL);
 	}
