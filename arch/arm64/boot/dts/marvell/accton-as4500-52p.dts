@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Device Tree For Accton as4500-52p.
+ *
+ * Copyright (C) 2021 Marvell
+ *
+ */
+
+#include "accton-as4500-52p.dtsi"
+
+/ {
+	model = "Marvell AC5X RD board";
+};
+
+&mdio {
+	status = "disabled";
+	pinctrl-names = "default";
+	phy0: ethernet-phy@0 {
+		reg = <0x0>;
+	};
+};
+
+&eth0 {
+	status = "disabled";
+	phy-mode = "sgmii";
+	phy = <&phy0>;
+};
+
+&usb0 {
+	status= "okay";
+};
+
+&usb1 {
+	compatible = "chipidea,usb2";
+	phys = <&usb1phy>;
+	phy-names = "usb-phy";
+	dr_mode = "host";
+};
+
