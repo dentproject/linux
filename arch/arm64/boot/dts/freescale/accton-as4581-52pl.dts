@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+//
+// Device Tree file for LX2160ARDB
+//
+// Copyright 2018-2020 NXP
+
+/dts-v1/;
+
+#include "accton-as4581-52pl.dtsi"
+
+/ {
+	model = "NXP Layerscape LX2160ARDB";
+	compatible = "fsl,lx2160a-rdb", "fsl,lx2160a";
+
+	aliases {
+		crypto = &crypto;
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	sb_3v3: regulator-sb3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "MC34717-3.3VSB";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-boot-on;
+		regulator-always-on;
+	};
+};
+
+&can0 {
+	status = "okay";
+
+	can-transceiver {
+		max-bitrate = <5000000>;
+	};
+};
+
+&can1 {
+	status = "okay";
+
+	can-transceiver {
+		max-bitrate = <5000000>;
+	};
+};
+
+&crypto {
+	status = "okay";
+};
+
+&dpmac7 {
+    status = "okay";
+	/*phy-handle = <&aquantia_phy1>;*/
+    fixed-link = <10 1 10000 0 0>;
+	phy-connection-type = "usxgmii";
+	/*managed = "in-band-status";*/
+};
+&dpmac8 {
+    status = "okay";
+	/*phy-handle = <&aquantia_phy2>;*/
+    fixed-link = <11 1 10000 0 0>;
+	phy-connection-type = "usxgmii";
+	/*managed = "in-band-status";*/
+};
+&dpmac9 {
+    status = "okay";
+	/*phy-handle = <&aquantia_phy1>;*/
+    fixed-link = <12 1 10000 0 0>;
+	phy-connection-type = "usxgmii";
+	/*managed = "in-band-status";*/
+};
+&dpmac10 {
+    status = "okay";
+	/*phy-handle = <&aquantia_phy2>;*/
+    fixed-link = <13 1 10000 0 0>;
+	phy-connection-type = "usxgmii";
+	/*managed = "in-band-status";*/
+};
+&dpmac17 {
+    status = "okay";
+	phy-handle = <&rgmii_phy1>;
+	phy-connection-type = "rgmii-id";
+};
+
+&emdio1 {
+	status = "okay";
+
+	rgmii_phy1: ethernet-phy@1 {
+		/* AR8035 PHY */
+		/*compatible = "ethernet-phy-id004d.d072";*/
+        compatible = "ethernet-phy-id0141.0dd1";
+		reg = <0x1>;
+		eee-broken-1000t;
+	};
+};
+
+&emdio2 {
+	status = "okay";
+};
+
+&esdhc0 {
+	status = "okay";
+};
+
+&fspi {
+	status = "okay";
+
+    flash@0 {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <50000000>;
+		#spi-rx-bus-width = <4>;
+                partition@0 {
+                        reg = <0x0 0x1000000>;
+                        label = "uboot";
+                };
+
+                partition@1 {
+                        reg = <0x1000000 0x100000>;
+                        label = "uboot-env";
+                };
+
+                partition@2 {
+                        reg = <0x1100000 0x2800000>;
+                        label = "onie";
+                };
+    };
+};
+
+&dspi1 {
+    status = "okay";
+    spi-tpm@0 {
+        compatible = "infineon,slb9670";
+        /*mode 0*/
+        reg = <0>;
+        /*spi-max-frequency = <38000000>;*/
+        spi-max-frequency = <4000000>;
+    };
+	dflash1: flash@1 {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "jedec,spi-nor";
+		reg = <1>;
+		spi-max-frequency = <1000000>;
+	};
+};
+
+&i2c0 {
+	status = "okay";
+};
+&i2c1 {
+	status = "okay";
+};
+&i2c2 {
+	status = "okay";
+};
+&i2c3 {
+	status = "okay";
+};
+&i2c4 {
+	status = "okay";
+};
+&i2c5 {
+	status = "okay";
+};
+&i2c6 {
+	status = "okay";
+};
+&i2c7 {
+	status = "okay";
+};
+
+&pcs_mdio3 {
+	status = "okay";
+};
+
+&pcs_mdio4 {
+	status = "okay";
+};
+
+&sata0 {
+	status = "okay";
+};
+
+&sata1 {
+	status = "okay";
+};
+
+&sata2 {
+	status = "okay";
+};
+
+&sata3 {
+	status = "okay";
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&uart1 {
+	status = "okay";
+};
+
+&usb0 {
+	status = "okay";
+};
+
+&usb1 {
+	status = "okay";
+};
+
+&emdio2 {
+	inphi_phy: ethernet-phy@0 {
+		compatible = "ethernet-phy-id0210.7440";
+		reg = <0x0>;
+	};
+};
+
+&dpmac5 {
+	phy-handle = <&inphi_phy>;
+};
+
+&dpmac6 {
+	phy-handle = <&inphi_phy>;
+};
