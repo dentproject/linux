@@ -7,7 +7,7 @@ prestera-objs		:= prestera_main.o prestera_hw.o prestera_dsa.o \
 			   prestera_router.o prestera_router_hw.o prestera_matchall.o \
 			   prestera_ct.o prestera_dcb.o prestera_qdisc.o \
 			   prestera_fw.o prestera_debugfs.o prestera_fw_log.o \
-			   prestera_nve.o
+			   prestera_nve.o prestera_fw_comm.o
 
 prestera-$(CONFIG_MRVL_PRESTERA_DEBUG) += prestera_log.o
 ccflags-$(CONFIG_MRVL_PRESTERA_DEBUG) += -DCONFIG_MRVL_PRESTERA_DEBUG
