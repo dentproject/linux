@@ -21,6 +21,7 @@
 
 #define PRESTERA_MSG_MAX_SIZE 1500
 #define PRESTERA_MSG_CHUNK_SIZE 1024
+#define PRESTERA_MSG_DEBUG_INFRA_CHUNK_SIZE    1450
 
 #define PRESTERA_DEFAULT_VID 1
 
@@ -34,6 +35,8 @@
 #define PRESTERA_PORT_SRCID_ZERO 0 /* source_id */
 
 #define PRESTERA_QOS_SP_COUNT 8
+
+#define PRESTERA_DEBUG_RESPONSE_MAX_SIZE 1024
 
 #define PRESTERA_IPG_DEFAULT_VALUE (12)
 #define PRESTERA_IPG_ALIGN_VALUE (4)
@@ -395,6 +398,7 @@ struct prestera_router;
 struct prestera_rif;
 struct prestera_trap_data;
 struct prestera_rxtx;
+struct prestera_fw_comm;
 
 #define PRESTERA_DEV_ID_TYPE_AC5	0xB400
 #define PRESTERA_DEV_ID_TYPE_AC5X	0x9800
@@ -433,6 +437,7 @@ struct prestera_switch {
 	struct prestera_rxtx *rxtx;
 	struct prestera_counter *counter;
 	struct list_head sched_list;
+	struct prestera_fw_comm *fw_comm;
 };
 
 struct prestera_router {

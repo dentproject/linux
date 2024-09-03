@@ -33,6 +33,7 @@
 #include "prestera_span.h"
 #include "prestera_switchdev.h"
 #include "prestera_dcb.h"
+#include "prestera_fw_comm.h"
 #include "prestera_qdisc.h"
 
 #define PRESTERA_DEV_ID_REG		0x004C
@@ -2306,8 +2307,15 @@ static int prestera_init(struct prestera_switch *sw)
 	if (err)
 		goto err_debugfs_init;
 
+	err = pr_fw_communication_init(sw);
+	if (err)
+		goto err_fw_communication_init;
+
 	return 0;
 
+
+err_fw_communication_init:
+	pr_fw_communication_fini(sw);
 err_debugfs_init:
 	prestera_event_handlers_unregister(sw);
 err_event_handlers:
@@ -2357,6 +2365,7 @@ static void prestera_fini(struct prestera_switch *sw)
 
 	prestera_hw_keepalive_fini(sw);
 	prestera_hw_switch_reset(sw);
+	pr_fw_communication_fini(sw);
 	of_node_put(sw->np);
 }
 

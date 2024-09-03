@@ -14,6 +14,7 @@
 #include "prestera_fw_log.h"
 #include "prestera_counter.h"
 #include "prestera_rxtx.h"
+#include "prestera_fw_comm.h"
 
 #define PRESTERA_HW_INIT_TIMEOUT 30000000	/* 30sec */
 #define PRESTERA_HW_MIN_MTU 64
@@ -25,6 +26,12 @@
 #ifndef PRESTERA_FW_KEEPALIVE_WD_MAX_KICKS
 #define PRESTERA_FW_KEEPALIVE_WD_MAX_KICKS	15
 #endif /* PRESTERA_FW_KEEPALIVE_WD_MAX_KICKS */
+
+/* FW CPU has a 5s timeout mostly for luaCli commands.
+ * If that timeout doesn't trigger, fall back on this one
+ * and stop waiting for a response after 7s.
+ */
+#define PRESTERA_FW_DEBUG_INFRA_MSG_TIMEOUT    7000
 
 enum prestera_cmd_type_t {
 	PRESTERA_CMD_TYPE_SWITCH_INIT = 0x1,
@@ -160,6 +167,8 @@ enum prestera_cmd_type_t {
 	PRESTERA_CMD_TYPE_POLICER_SET = 0x1502,
 
 	PRESTERA_CMD_TYPE_CPU_CODE_COUNTERS_GET = 0x2000,
+
+	PRESTERA_CMD_DEBUG_REQ = 0x2100,
 
 	PRESTERA_CMD_TYPE_ACK = 0x10000,
 	PRESTERA_CMD_TYPE_MAX
@@ -1133,6 +1142,25 @@ static void prestera_hw_build_tests(void)
 	BUILD_BUG_ON(sizeof(struct prestera_msg_event_fdb) != 20);
 	BUILD_BUG_ON(sizeof(struct prestera_msg_event_log) != 8);
 }
+
+struct prestera_msg_debug_req {
+       struct prestera_msg_cmd cmd;
+       u8 req_type;
+       char cmd_args[PRESTERA_FW_COMM_MAX_ARGS_SIZE];
+} __packed __aligned(4);
+
+/* If the size of this structure will ever get bigger than PRESTERA_MSG_MAX_SIZE,
+ * consider decreasing PRESTERA_MSG_DEBUG_INFRA_CHUNK_SIZE here and in appDemo
+ * to avoid message drops.
+ */
+struct prestera_msg_debug_resp {
+       struct prestera_msg_ret ret;
+       u8 err_code;
+       u8 has_next;
+       u8 new_chunk_filled;
+       u16 resp_buff_size;
+       char resp_buff[PRESTERA_MSG_DEBUG_INFRA_CHUNK_SIZE];
+} __packed __aligned(4);
 
 static void fw_reset_wdog(struct prestera_device *dev);
 
@@ -3487,6 +3515,76 @@ int prestera_hw_mdb_destroy(struct prestera_mdb_entry *mdb)
 
 	return fw_send_req(mdb->sw, PRESTERA_CMD_TYPE_MDB_DESTROY, &req);
 }
+
+
+bool prestera_hw_dbg_req_should_stop(unsigned int chunk_index,
+       struct prestera_msg_debug_resp resp)
+{
+       /* We should stop if:
+        * - we reached the maximum chunk number
+        * - there is no other packet to be sent
+        */
+       return (chunk_index == PRESTERA_FW_COMM_MAX_RECV_CHUNKS - 1) ||
+                       (!resp.has_next);
+}
+
+int prestera_hw_dbg_req_send(struct prestera_switch *sw, u32 req_type, char *args, u8 *fw_err_code)
+{
+       struct prestera_msg_debug_req req;
+       struct prestera_msg_debug_resp resp;
+       char *out_buff = sw->fw_comm->output_buff;
+       int *out_buff_size = &sw->fw_comm->output_size;
+       int err = 0;
+       unsigned int chunk_index = 0;
+
+       *fw_err_code = 0;
+       req.req_type = req_type;
+
+       memset(req.cmd_args, 0, sizeof(req.cmd_args));
+       strcpy(req.cmd_args, args);
+
+       while (1) {
+               err = fw_send_req_resp_wait(sw, PRESTERA_CMD_DEBUG_REQ, &req, &resp,
+                       PRESTERA_FW_DEBUG_INFRA_MSG_TIMEOUT);
+               if (err) {
+                       /* Treat this as a separate error case since we have to keep in
+                        * sync error definition between main and FW CPU.
+                        */
+                       if (err == -EBUSY)
+                               dev_err(sw->dev->dev, "Response from FW CPU timed out\n");
+                       *fw_err_code = resp.err_code;
+                       break;
+               }
+
+               if (resp.resp_buff_size > PRESTERA_MSG_DEBUG_INFRA_CHUNK_SIZE) {
+                       dev_err(sw->dev->dev, "Maximum allowed_buff_size(%d) < received(%d)\n",
+                               PRESTERA_MSG_DEBUG_INFRA_CHUNK_SIZE, resp.resp_buff_size);
+                       return -EINVAL;
+               }
+
+               if (!out_buff) {
+                       dev_dbg(sw->dev->dev, "Output buffer is empty\n");
+                       return -EINVAL;
+               }
+               memcpy(out_buff, resp.resp_buff, resp.resp_buff_size);
+
+               out_buff += resp.resp_buff_size;
+               *out_buff_size += resp.resp_buff_size;
+               chunk_index += resp.new_chunk_filled;
+
+               if (prestera_hw_dbg_req_should_stop(chunk_index, resp)) {
+                       dev_dbg(sw->dev->dev, "Stoppping at chunk_num=%d max_chunks=%d\n",
+                                chunk_index, PRESTERA_FW_COMM_MAX_RECV_CHUNKS);
+                       break;
+               }
+
+               /* Arguments should be sent only for the first request. */
+               memset(req.cmd_args, 0, sizeof(req.cmd_args));
+       }
+
+       return err;
+}
+
 
 int prestera_hw_ipg_set(struct prestera_switch *sw, u32 ipg)
 {

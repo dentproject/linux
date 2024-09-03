@@ -516,6 +516,10 @@ int prestera_hw_mdb_destroy(struct prestera_mdb_entry *mdb);
 int prestera_hw_ipg_set(struct prestera_switch *sw, u32 ipg);
 int prestera_hw_ipg_get(struct prestera_switch *sw, u32 *ipg);
 
+ /* Debug Infra API */
+int prestera_hw_dbg_req_send(struct prestera_switch *fw_comm, u32 req_type,
+				char *args, u8 *fw_err_code);
+
 /* QoS */
 int prestera_hw_port_qos_mapping_update(const struct prestera_port *port,
 					struct dcb_ieee_app_dscp_map *map);
